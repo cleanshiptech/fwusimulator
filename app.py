@@ -30,8 +30,7 @@ import streamlit as st
 # Page setup
 # -----------------------------------------------------------------------------
 st.set_page_config(
-    page_title="F
-    WU Coverage Simulator",
+    page_title="FWU Coverage Simulator",
     layout="wide",
     page_icon="🛠️",
 )
