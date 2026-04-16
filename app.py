@@ -40,6 +40,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import streamlit as st
 from matplotlib.collections import LineCollection, PatchCollection
+from PIL import Image
 
 # -----------------------------------------------------------------------------
 # Page setup
@@ -1485,10 +1486,16 @@ if not compare_mode:
         snapshot_slot.image(_init_buf.getvalue(), use_container_width=True)
 
         # ----- Prepare phase ----------------------------------------
+        # Strategy: render every frame as an RGBA PIL Image, then
+        # assemble them into a single animated GIF held as bytes in
+        # session_state. Playback is a single st.image(gif_bytes) call —
+        # the browser handles frame timing natively via the GIF's
+        # embedded per-frame duration, so we get smooth animation
+        # without Streamlit's websocket round-trip per frame (which was
+        # causing the "jumps from start to end" behaviour in the
+        # previous per-frame loop).
         if prepare:
             st.session_state["stop_play"] = False
-            # Precompute fixed axis limits for the full traversal so the
-            # camera doesn't drift as the array translates.
             fx, fy = full_traversal_limits(
                 scen, trail_rev, frame,
                 t_start_s=seg_start_ms / 1000.0,
@@ -1496,7 +1503,7 @@ if not compare_mode:
             times_ms_arr = np.linspace(seg_start_ms, seg_end_ms,
                                        int(play_frames)).astype(int)
 
-            frames_png: list[bytes] = []
+            pil_frames: list = []
             progress = st.progress(0.0, text="Preparing animation…")
             interrupted = False
             t_prep_start = time.perf_counter()
@@ -1507,7 +1514,8 @@ if not compare_mode:
                 t_sec = tm / 1000.0
                 cum_f = None
                 if prepare_underlay and frame == "Hull frame":
-                    cum_f, _m, _c = simulate_pressure(scen, t_stop_s=max(t_sec, 1e-6))
+                    cum_f, _m, _c = simulate_pressure(
+                        scen, t_stop_s=max(t_sec, 1e-6))
                 fig_f = plot_motion_fast(
                     scen, t_sec,
                     trail_revolutions=trail_rev,
@@ -1519,17 +1527,43 @@ if not compare_mode:
                 # would make the canvas shrink/jump during playback.
                 fig_f.savefig(buf, format="png", dpi=110)
                 plt.close(fig_f)
-                frames_png.append(buf.getvalue())
+                buf.seek(0)
+                # Convert to palette-mode (P) with adaptive palette —
+                # GIF only supports 256 colours per frame, but we get
+                # acceptable quality for line art + trails.
+                img = Image.open(buf).convert("RGB").convert(
+                    "P", palette=Image.ADAPTIVE, colors=192)
+                pil_frames.append(img)
                 progress.progress(
                     (i + 1) / len(times_ms_arr),
                     text=f"Preparing animation… {i+1}/{len(times_ms_arr)}")
             prep_wall = time.perf_counter() - t_prep_start
             progress.empty()
 
-            if not interrupted:
+            if not interrupted and pil_frames:
+                # Assemble GIF. Per-frame duration in ms is
+                # frame_wall_dt × 1000, clamped to >= 20 ms (the GIF
+                # spec's lower bound — browsers override anything below
+                # ~20 ms to 100 ms).
+                gif_frame_ms = max(int(round(frame_wall_dt * 1000)), 20)
+                gif_buf = io.BytesIO()
+                pil_frames[0].save(
+                    gif_buf,
+                    format="GIF",
+                    save_all=True,
+                    append_images=pil_frames[1:],
+                    duration=gif_frame_ms,
+                    loop=0,             # 0 = loop forever
+                    disposal=2,         # clear each frame before next
+                    optimize=False,
+                )
+                gif_bytes = gif_buf.getvalue()
+
                 st.session_state["anim_frames"] = {
                     "key": cache_key,
-                    "frames": frames_png,
+                    "gif": gif_bytes,
+                    "n_frames": len(pil_frames),
+                    "gif_frame_ms": gif_frame_ms,
                     "times_ms": times_ms_arr.tolist(),
                     "total_time_s": total_time_s,
                     "prep_wall_s": prep_wall,
@@ -1537,37 +1571,44 @@ if not compare_mode:
                     "ylim": fy,
                 }
                 st.success(
-                    f"Cached {len(frames_png)} frames in "
-                    f"{prep_wall:.1f} s. Click ▶ Play.")
-            else:
+                    f"Cached GIF with {len(pil_frames)} frames "
+                    f"({len(gif_bytes)/1024:.0f} kB) in {prep_wall:.1f} s. "
+                    f"Click ▶ Play.")
+            elif interrupted:
                 st.warning(
-                    f"Preparation stopped after {len(frames_png)} frames.")
+                    f"Preparation stopped after {len(pil_frames)} frames.")
             st.session_state["stop_play"] = False
 
         # ----- Playback phase ---------------------------------------
+        # The GIF loops natively in the browser, so "Play" just means
+        # "(re-)display the cached GIF". No per-frame Python loop, no
+        # websocket per frame → no start/end jumping.
         cached_anim = st.session_state.get("anim_frames")
         if play_cached:
             if not cached_anim or cached_anim.get("key") != cache_key:
                 st.warning(
                     "No cached animation matches the current settings. "
                     "Click *Prepare animation* first.")
-            else:
-                st.session_state["stop_play"] = False
-                frames_png = cached_anim["frames"]
-                times_ms_arr = cached_anim["times_ms"]
-                for i, (png, tm) in enumerate(zip(frames_png, times_ms_arr)):
-                    if st.session_state.get("stop_play"):
-                        break
-                    snapshot_slot.image(png, use_container_width=True)
-                    time.sleep(frame_wall_dt)
+            elif "gif" in cached_anim:
+                snapshot_slot.image(
+                    cached_anim["gif"], use_container_width=True)
                 # Leave slider at the final frame
-                st.session_state.t_ms = int(times_ms_arr[-1])
-                st.session_state["stop_play"] = False
+                if cached_anim.get("times_ms"):
+                    st.session_state.t_ms = int(cached_anim["times_ms"][-1])
+
+        # Always re-display the cached GIF if it exists and matches —
+        # this way the animation persists across reruns (e.g. when
+        # other widgets are touched), not only when Play is clicked.
+        if (cached_anim and cached_anim.get("key") == cache_key
+                and "gif" in cached_anim and not play_cached):
+            snapshot_slot.image(
+                cached_anim["gif"], use_container_width=True)
 
         if cached_anim and cached_anim.get("key") == cache_key:
             st.caption(
-                f"✅ Animation cached: {len(cached_anim['frames'])} frames "
-                f"({sum(len(f) for f in cached_anim['frames'])/1024:.0f} kB). "
+                f"✅ Animation cached: {cached_anim['n_frames']} frames "
+                f"as GIF ({len(cached_anim['gif'])/1024:.0f} kB, "
+                f"{cached_anim['gif_frame_ms']} ms/frame). "
                 f"Prep took {cached_anim.get('prep_wall_s', 0):.1f} s.")
 
         st.caption(
