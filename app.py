@@ -1117,9 +1117,12 @@ if not compare_mode:
         speed_map = {"0.25x": 0.25, "0.5x": 0.5, "1x": 1.0,
                      "2x": 2.0, "4x": 4.0}
         speed = speed_map[play_speed]
-        # Baseline: aim for ~40 ms per frame on screen at 1x.
-        baseline_wall_dt = 0.040
-        frame_wall_dt = baseline_wall_dt / speed
+        # Baseline: aim for ~60 ms per frame on screen at 1x.
+        # Streamlit coalesces DOM updates below ~30 ms, so we enforce a
+        # minimum dwell — otherwise at 4x playback looks like an
+        # instantaneous jump from start to finish.
+        baseline_wall_dt = 0.060
+        frame_wall_dt = max(baseline_wall_dt / speed, 0.030)
         real_dt_per_frame = total_time_s / max(play_frames, 1)
         # Ratio of wall time to real time for the same animation segment.
         #   >1  → animation runs SLOWER than real life
@@ -1147,13 +1150,25 @@ if not compare_mode:
         )
 
         # ----- Render current snapshot (always shown) ---------------
+        # Render as PNG via the same pipeline used for playback, so the
+        # image size matches the cached frames exactly (no "drawing
+        # shrinks when you click Play" surprise).
         snapshot_slot = st.empty()
-        snapshot_slot.pyplot(
-            plot_motion_fast(scen, t_ms / 1000.0,
-                             trail_revolutions=trail_rev,
-                             frame=frame,
-                             cumulative_strip=cumulative),
-            clear_figure=True)
+        _init_fig = plot_motion_fast(
+            scen, t_ms / 1000.0,
+            trail_revolutions=trail_rev,
+            frame=frame,
+            cumulative_strip=cumulative,
+            # If an animation is cached, use its fixed axes so the
+            # snapshot and the movie share the same camera; otherwise
+            # let the snapshot auto-fit.
+            fixed_xlim=(cached_anim["xlim"] if cached_anim else None),
+            fixed_ylim=(cached_anim["ylim"] if cached_anim else None),
+        )
+        _init_buf = io.BytesIO()
+        _init_fig.savefig(_init_buf, format="png", dpi=110)
+        plt.close(_init_fig)
+        snapshot_slot.image(_init_buf.getvalue(), use_container_width=True)
 
         # ----- Prepare phase ----------------------------------------
         if prepare:
@@ -1182,8 +1197,9 @@ if not compare_mode:
                     cumulative_strip=cum_f,
                     fixed_xlim=fx, fixed_ylim=fy)
                 buf = io.BytesIO()
-                fig_f.savefig(buf, format="png", dpi=110,
-                              bbox_inches="tight")
+                # No bbox_inches="tight" — cropping varies per frame and
+                # would make the canvas shrink/jump during playback.
+                fig_f.savefig(buf, format="png", dpi=110)
                 plt.close(fig_f)
                 frames_png.append(buf.getvalue())
                 progress.progress(
@@ -1199,6 +1215,8 @@ if not compare_mode:
                     "times_ms": times_ms_arr.tolist(),
                     "total_time_s": total_time_s,
                     "prep_wall_s": prep_wall,
+                    "xlim": fx,
+                    "ylim": fy,
                 }
                 st.success(
                     f"Cached {len(frames_png)} frames in "
@@ -1222,7 +1240,7 @@ if not compare_mode:
                 for i, (png, tm) in enumerate(zip(frames_png, times_ms_arr)):
                     if st.session_state.get("stop_play"):
                         break
-                    snapshot_slot.image(png, use_column_width=True)
+                    snapshot_slot.image(png, use_container_width=True)
                     time.sleep(frame_wall_dt)
                 # Leave slider at the final frame
                 st.session_state.t_ms = int(times_ms_arr[-1])
