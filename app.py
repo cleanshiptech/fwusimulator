@@ -95,7 +95,7 @@ class Scenario:
 
     # Hull strip & threshold
     sim_length_mm: int = 5000
-    clean_threshold: float = 20.0
+    clean_threshold: float = 5.0    # bar·s — calibrate against field trials
 
     # Post-processing
     steady_state_only: bool = True
@@ -219,7 +219,12 @@ def scenario_controls(prefix: str, defaults: Scenario, container) -> Scenario:
         "Cleaning threshold (bar*s)", 0.5, 200.0, float(s.clean_threshold), step=0.5,
         key=k("clean_threshold"),
         help="A cell counts as 'cleaned' when its integrated pressure "
-             "exposure exceeds this value.")
+             "exposure exceeds this value. Calibrate against a field "
+             "trial — a good starting point for light biofilm at "
+             "200–300 bar is around 3–8 bar·s. Values above ~20 bar·s "
+             "will make most cells register as uncleaned at realistic "
+             "traverse speeds, collapsing the coverage KPI to 0% and "
+             "the Hull-tab cleaning rate to zero.")
     s.steady_state_only = container.checkbox(
         "Report KPIs on steady-state core only",
         value=s.steady_state_only,
@@ -1591,42 +1596,9 @@ if not compare_mode:
                 "used here to compute the per-side time.")
             st.stop()
 
-        # ----- Cleaning-rate derivation ---------------------------
-        # Area cleaned per unit wall time =
-        #     array_effective_width [m]  ×  ROV speed [m/s]  ×  coverage
-        # where coverage is the fraction of cells within the swept strip
-        # that exceed the clean threshold (from the Impact sim).
-        array_span_x_mm = float(cached_impact["array_span_x_mm"])
-        coverage_frac = float(cached_impact["coverage_pct"]) / 100.0
-        rov_speed_mps = float(cached_impact["rov_speed_kn"]) * KNOTS_TO_MPS
-        # Effective width: the swept strip's across-track extent.
-        array_width_m = array_span_x_mm / 1000.0
-        # Gross footprint swept per second, m²/s
-        footprint_rate_m2_s = array_width_m * rov_speed_mps
-        # Effective *cleaned* rate = footprint × cleaned-fraction
-        cleaning_rate_m2_s = footprint_rate_m2_s * coverage_frac
-        cleaning_rate_m2_h = cleaning_rate_m2_s * 3600.0
-
-        rate_c1, rate_c2, rate_c3 = st.columns(3)
-        rate_c1.metric(
-            "Array effective width",
-            f"{array_width_m:.2f} m",
-            help="Across-track span of the swept strip at the current yaw.")
-        rate_c2.metric(
-            "ROV speed",
-            f"{rov_speed_mps:.2f} m/s",
-            help=f"= {cached_impact['rov_speed_kn']:.2f} kn")
-        rate_c3.metric(
-            "Cleaning rate",
-            f"{cleaning_rate_m2_h:.0f} m²/h",
-            help=f"Footprint {footprint_rate_m2_s:.2f} m²/s × "
-                 f"coverage {coverage_frac*100:.1f}%.")
-
-        st.divider()
-
         # ----- Vessel inputs --------------------------------------
         st.markdown("**Vessel particulars**")
-        vin_c1, vin_c2, vin_c3 = st.columns(3)
+        vin_c1, vin_c2, vin_c3, vin_c4 = st.columns(4)
         loa_m = vin_c1.number_input(
             "LOA (m)", min_value=20.0, max_value=450.0, value=200.0,
             step=5.0, key="hull_loa",
@@ -1639,6 +1611,70 @@ if not compare_mode:
             "Draft (m)", min_value=1.0, max_value=25.0, value=12.0,
             step=0.5, key="hull_draft",
             help="Vertical distance from waterline to keel.")
+        track_overlap_pct = vin_c4.slider(
+            "Track overlap (%)", min_value=0, max_value=50, value=15,
+            step=1, key="hull_track_overlap",
+            help="Fraction of the array width that overlaps the previous "
+                 "track to avoid missed bands at string boundaries. "
+                 "Reduces effective cleaning rate by (1 − overlap). "
+                 "Typical field practice: 10–25%.")
+
+        # ----- Cleaning-rate derivation ---------------------------
+        # Area cleaned per unit wall time =
+        #     array_effective_width [m]  ×  ROV speed [m/s]
+        #         ×  coverage_fraction × (1 − overlap_fraction)
+        # where coverage is the fraction of cells within the swept strip
+        # that exceed the clean threshold (from the Impact sim) and
+        # overlap accounts for deliberate re-sweeping at string edges.
+        array_span_x_mm = float(cached_impact["array_span_x_mm"])
+        coverage_frac = float(cached_impact["coverage_pct"]) / 100.0
+        rov_speed_mps = float(cached_impact["rov_speed_kn"]) * KNOTS_TO_MPS
+        overlap_frac = track_overlap_pct / 100.0
+        # Effective width: the swept strip's across-track extent.
+        array_width_m = array_span_x_mm / 1000.0
+        effective_width_m = array_width_m * (1.0 - overlap_frac)
+        # Gross footprint swept per second, m²/s
+        footprint_rate_m2_s = array_width_m * rov_speed_mps
+        # Effective *cleaned* rate = footprint × coverage × (1 − overlap)
+        cleaning_rate_m2_s = (footprint_rate_m2_s
+                              * coverage_frac
+                              * (1.0 - overlap_frac))
+        cleaning_rate_m2_h = cleaning_rate_m2_s * 3600.0
+        # Treat anything below 1 m²/h as degenerate — avoids astronomical
+        # times when coverage_frac or ROV speed is effectively zero.
+        rate_valid = cleaning_rate_m2_h >= 1.0
+
+        rate_c1, rate_c2, rate_c3, rate_c4 = st.columns(4)
+        rate_c1.metric(
+            "Array width",
+            f"{array_width_m:.2f} m",
+            help="Across-track span of the swept strip at the current yaw.")
+        rate_c2.metric(
+            "Effective width",
+            f"{effective_width_m:.2f} m",
+            help=f"= array width × (1 − {track_overlap_pct}% overlap)")
+        rate_c3.metric(
+            "ROV speed",
+            f"{rov_speed_mps:.2f} m/s",
+            help=f"= {cached_impact['rov_speed_kn']:.2f} kn")
+        rate_c4.metric(
+            "Cleaning rate",
+            f"{cleaning_rate_m2_h:.0f} m²/h" if rate_valid else "—",
+            help=(f"Footprint {footprint_rate_m2_s:.2f} m²/s × "
+                  f"coverage {coverage_frac*100:.1f}% × "
+                  f"(1 − {track_overlap_pct}% overlap)."))
+
+        if not rate_valid:
+            st.error(
+                f"⚠ Cleaning rate is effectively zero "
+                f"({cleaning_rate_m2_h:.2f} m²/h). This usually means the "
+                f"Impact-tab coverage is 0% — either the scenario doesn't "
+                f"clean anything above the threshold, or the Impact "
+                f"simulation was run with a different scenario. "
+                f"Re-run **Run full simulation** in the Impact tab before "
+                f"reading the times below.")
+
+        st.divider()
 
         # ----- Hull-shape selection (visual cards) -----------------
         st.markdown("**Midship cross-section**")
@@ -1665,36 +1701,57 @@ if not compare_mode:
 
         # ----- Area & time computation ----------------------------
         areas = hull_wetted_areas(loa_m, beam_m, draft_m, shape_key)
-        side_time_s = areas["side_port"] / max(cleaning_rate_m2_s, 1e-9)
-        bottom_time_s = areas["bottom"] / max(cleaning_rate_m2_s, 1e-9)
-        total_time_s_hull = (areas["side_port"] + areas["side_starboard"]
-                             + areas["bottom"]) / max(cleaning_rate_m2_s, 1e-9)
 
-        def _fmt_hm(seconds: float) -> str:
+        def _fmt_duration(seconds: float) -> str:
+            """Human-readable duration. Uses min / h / d depending on scale.
+            Returns '—' for non-finite or negative values."""
+            if not math.isfinite(seconds) or seconds < 0:
+                return "—"
+            minutes = seconds / 60.0
+            if minutes < 60.0:
+                return f"{minutes:.0f} min"
             hours = seconds / 3600.0
-            if hours < 1.0:
-                return f"{seconds/60:.0f} min"
-            whole_h = int(hours)
-            min_left = int(round((hours - whole_h) * 60))
-            if min_left == 60:
-                whole_h += 1
-                min_left = 0
-            return f"{whole_h} h {min_left:02d} min"
+            if hours < 24.0:
+                whole_h = int(hours)
+                min_left = int(round((hours - whole_h) * 60))
+                if min_left == 60:
+                    whole_h += 1
+                    min_left = 0
+                return f"{whole_h} h {min_left:02d} min"
+            days = hours / 24.0
+            if days < 10.0:
+                whole_d = int(days)
+                h_left = int(round((days - whole_d) * 24))
+                if h_left == 24:
+                    whole_d += 1
+                    h_left = 0
+                return f"{whole_d} d {h_left:02d} h"
+            return f"{days:.1f} d"
+
+        if rate_valid:
+            side_time_s = areas["side_port"] / cleaning_rate_m2_s
+            bottom_time_s = areas["bottom"] / cleaning_rate_m2_s
+            total_time_s_hull = (areas["side_port"] + areas["side_starboard"]
+                                 + areas["bottom"]) / cleaning_rate_m2_s
+        else:
+            side_time_s = float("nan")
+            bottom_time_s = float("nan")
+            total_time_s_hull = float("nan")
 
         st.markdown("**Per-side wetted area and cleaning time**")
         out_c1, out_c2, out_c3, out_c4 = st.columns(4)
         out_c1.metric(
             "Port side",
             f"{areas['side_port']:.0f} m²",
-            help=_fmt_hm(side_time_s))
+            help=_fmt_duration(side_time_s))
         out_c2.metric(
             "Starboard side",
             f"{areas['side_starboard']:.0f} m²",
-            help=_fmt_hm(side_time_s))
+            help=_fmt_duration(side_time_s))
         out_c3.metric(
             "Bottom",
             f"{areas['bottom']:.0f} m²",
-            help=_fmt_hm(bottom_time_s))
+            help=_fmt_duration(bottom_time_s))
         out_c4.metric(
             "Total wetted area",
             f"{areas['total']:.0f} m²",
@@ -1702,11 +1759,11 @@ if not compare_mode:
                  "superstructure, appendages).")
 
         time_c1, time_c2, time_c3, time_c4 = st.columns(4)
-        time_c1.metric("Port side time", _fmt_hm(side_time_s))
-        time_c2.metric("Starboard side time", _fmt_hm(side_time_s))
-        time_c3.metric("Bottom time", _fmt_hm(bottom_time_s))
+        time_c1.metric("Port side time", _fmt_duration(side_time_s))
+        time_c2.metric("Starboard side time", _fmt_duration(side_time_s))
+        time_c3.metric("Bottom time", _fmt_duration(bottom_time_s))
         time_c4.metric("**Total cleaning time**",
-                       _fmt_hm(total_time_s_hull))
+                       _fmt_duration(total_time_s_hull))
 
         st.caption(
             f"Midship section perimeter = {areas['section_perim_m']:.2f} m "
@@ -1717,9 +1774,10 @@ if not compare_mode:
             f"{HULL_SHAPES[shape_key]['k_side']:.2f} × {areas['C_l']:.2f} "
             f"= {areas['side_port']:.0f} m². Bottom area ≈ LOA × "
             f"perimeter × C_L = {areas['bottom']:.0f} m². "
-            "Assumes continuous, uninterrupted cleaning at the Impact-tab "
-            "rate; real-world operations include docking, repositioning, "
-            "overlap, and transit overhead.")
+            f"Effective cleaning rate accounts for **{track_overlap_pct}% "
+            f"track overlap**. Assumes continuous, uninterrupted cleaning "
+            "— real-world operations also include docking, repositioning, "
+            "and transit overhead.")
 
 else:
     with st.sidebar:
