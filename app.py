@@ -697,7 +697,34 @@ def plot_motion_fast(s: Scenario, t_now_s: float,
     # For each (disc, nozzle) series of T points -> (T-1) line segments.
     # Concatenate all DNx (T-1) segments into one array of shape (S, 2, 2).
     T = pts.shape[0]
-    fig, ax = plt.subplots(figsize=(9, 5.5))
+
+    # Pick a figure size so the equal-aspect plot region fills most of
+    # the canvas without excessive whitespace. Use fixed_xlim/fixed_ylim
+    # if provided (they define the real extent); otherwise estimate
+    # from current-frame pts.
+    if fixed_xlim is not None and fixed_ylim is not None:
+        x_span = fixed_xlim[1] - fixed_xlim[0]
+        y_span = fixed_ylim[1] - fixed_ylim[0]
+    else:
+        x_span = max(60.0, float(pts[..., 0].ptp()) + 300)
+        y_span = max(60.0, float(pts[..., 1].ptp()) + 300)
+
+    # Plot area target: short side ≈ 4", long side scales with data aspect
+    # but capped so the figure stays reasonable in the Streamlit column.
+    data_aspect = y_span / max(x_span, 1e-6)
+    # Axes margin for title/labels/ticks (≈ 1.5" total in each dimension)
+    axes_margin_in = 1.5
+    if data_aspect >= 1.0:
+        # Tall plot (Hull frame typical): fix width at 6", scale height
+        plot_w = 6.0
+        plot_h = min(plot_w * data_aspect, 12.0)  # cap at 12"
+    else:
+        # Wide plot (ROV frame typical): fix height at 4", scale width
+        plot_h = 4.0
+        plot_w = min(plot_h / data_aspect, 14.0)
+    fig_w = plot_w + axes_margin_in
+    fig_h = plot_h + axes_margin_in
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
 
     # Cumulative heatmap underlay (hull frame only)
     if cumulative_strip is not None and frame == "Hull frame":
@@ -837,18 +864,28 @@ def plot_motion_fast(s: Scenario, t_now_s: float,
 def full_traversal_limits(s: Scenario, trail_revolutions: float,
                           frame: str,
                           n_samples: int = 60,
-                          pad_mm: float = 60.0
+                          pad_mm: float = 60.0,
+                          t_start_s: float = 0.0,
+                          t_end_s: float | None = None,
                           ) -> tuple[tuple[float, float], tuple[float, float]]:
     """
-    Compute the Hull-frame (or ROV-frame) axis window so that the
-    array and trails remain visible for ALL t in 0..total_time_s.
+    Compute the Hull-frame (or ROV-frame) axis window so the array and
+    trails remain visible for ALL t in ``[t_start_s, t_end_s]``.
 
-    This makes the camera static during playback — no shifting.
+    Default range is the full traversal (``t_end_s=None`` → total time).
+    Pass a narrower window to get a tighter camera for a segment-only
+    playback.
     """
     rotated = compute_rotated_discs(s)
     phases = [2 * math.pi * i / max(len(rotated), 1) for i in range(len(rotated))]
     rov_speed_mm_s = s.rov_speed_kn * KNOTS_TO_MPS * 1000.0
     total_time_s = s.sim_length_mm / max(rov_speed_mm_s, 1e-6)
+    if t_end_s is None:
+        t_end_s = total_time_s
+    t_start_s = max(0.0, float(t_start_s))
+    t_end_s = min(float(t_end_s), total_time_s)
+    if t_end_s <= t_start_s:
+        t_end_s = t_start_s + 1e-3
 
     rxs_rot = [r[0] for r in rotated]
     rys_rot = [r[1] for r in rotated]
@@ -859,7 +896,7 @@ def full_traversal_limits(s: Scenario, trail_revolutions: float,
     omega = s.rpm * 2 * math.pi / 60.0
     trail_dur = trail_revolutions * (2 * math.pi / max(omega, 1e-6))
 
-    ts = np.linspace(0.0, total_time_s, max(n_samples, 2))
+    ts = np.linspace(t_start_s, t_end_s, max(n_samples, 2))
     pts = nozzle_trails_vec(s, ts, rotated, phases)   # (T, D, N, 2)
 
     if frame == "ROV frame":
@@ -873,18 +910,18 @@ def full_traversal_limits(s: Scenario, trail_revolutions: float,
         y_lo = min(float(pts[..., 1].min()), y_top_rel) - pad_mm
         y_hi = max(float(pts[..., 1].max()), y_bot_rel) + pad_mm
     else:
-        # Hull frame: array slides from y_start to y_end; include the
+        # Hull frame: array slides from t_start..t_end; include the
         # trail extent too (which lags behind by up to trail_dur).
         array_leading_y = min(rys_rot) - s.disc_diameter_mm / 2
         margin_mm = 120.0
         array_y_offset_init = -margin_mm - array_leading_y
-        y_top_t0 = y_top_rel + array_y_offset_init
+        y_top_tstart = y_top_rel + array_y_offset_init \
+            + rov_speed_mm_s * t_start_s
         y_bot_tend = y_bot_rel + array_y_offset_init \
-            + rov_speed_mm_s * total_time_s
-        # trails extend up to trail_dur behind the current array position;
-        # the backmost trail tail ≈ current array_y - rov_speed*trail_dur.
+            + rov_speed_mm_s * t_end_s
+        # trails extend up to trail_dur behind the current array position
         trail_back = rov_speed_mm_s * trail_dur
-        y_lo = min(y_top_t0, y_top_t0 - trail_back) - pad_mm
+        y_lo = min(y_top_tstart, y_top_tstart - trail_back) - pad_mm
         y_hi = y_bot_tend + pad_mm
 
     all_x = list(rxs_rot) + [float(pts[..., 0].min()), float(pts[..., 0].max())]
@@ -1029,22 +1066,41 @@ if not compare_mode:
         # playback. Hull-frame axes are fixed over the full traversal.
         pc1, pc2, pc3, pc4 = st.columns([1.2, 1.2, 1.2, 1.3])
         play_frames = pc1.slider(
-            "Animation frames", 20, 200, 80, step=10, key="play_frames",
-            help="More frames = smoother animation, but slower to prepare.")
+            "Animation frames", 20, 500, 120, step=10, key="play_frames",
+            help="More frames = smoother rotation, but slower to prepare. "
+                 "Rule of thumb: aim for ≤ 0.1 disc revolution per frame "
+                 "(see strobo warning below).")
         play_speed = pc2.select_slider(
             "Speed", options=["0.25x", "0.5x", "1x", "2x", "4x"],
             value="1x", key="play_speed",
-            help="Wall-clock speed multiplier relative to the 'slowed down' "
-                 "animation baseline. 1x = one frame every ~40 ms.")
+            help="Wall-clock speed multiplier. 1x = one frame every 60 ms.")
         prepare_underlay = pc3.checkbox(
             "Underlay during prepare", value=False, key="prepare_underlay",
             help="Include cumulative cleaning heatmap on each frame. "
-                 "Much slower to prepare — only for short traversals.")
+                 "Much slower to prepare — only for short segments.")
         clear_anim = pc4.button(
             "Clear animation cache", key="clear_anim_btn",
             help="Remove cached frames (e.g. after changing the scenario).")
         if clear_anim:
             st.session_state.pop("anim_frames", None)
+
+        # Segment selector: animate only a sub-window of the traversal.
+        # Useful for smooth rotation — a 500 ms window at 120 frames gives
+        # 4.2 ms per frame (0.04 rev at 800 RPM), which spins smoothly.
+        sg1, sg2 = st.columns([2, 2])
+        seg_start_ms = sg1.slider(
+            "Segment start (ms)", 0, total_ms,
+            min(int(st.session_state.get("t_ms", total_ms // 4)), total_ms - 100),
+            step=max(1, total_ms // 400), key="seg_start_ms",
+            help="Animate only from this time onwards.")
+        seg_dur_ms = sg2.slider(
+            "Segment duration (ms)",
+            100, total_ms,
+            min(1000, total_ms), step=max(1, total_ms // 100),
+            key="seg_dur_ms",
+            help="How much of the traversal to animate. Shorter = smoother "
+                 "spin for the same frame count.")
+        seg_end_ms = min(seg_start_ms + seg_dur_ms, total_ms)
 
         ac1, ac2, ac3 = st.columns([1.2, 1.2, 2.4])
         prepare = ac1.button(
@@ -1066,6 +1122,8 @@ if not compare_mode:
             frame,
             int(play_frames),
             bool(prepare_underlay),
+            int(seg_start_ms),
+            int(seg_end_ms),
         )
         cached_anim = st.session_state.get("anim_frames")
         if cached_anim and cached_anim.get("key") != cache_key:
@@ -1123,7 +1181,8 @@ if not compare_mode:
         # instantaneous jump from start to finish.
         baseline_wall_dt = 0.060
         frame_wall_dt = max(baseline_wall_dt / speed, 0.030)
-        real_dt_per_frame = total_time_s / max(play_frames, 1)
+        seg_dur_s = max((seg_end_ms - seg_start_ms) / 1000.0, 1e-9)
+        real_dt_per_frame = seg_dur_s / max(play_frames, 1)
         # Ratio of wall time to real time for the same animation segment.
         #   >1  → animation runs SLOWER than real life
         #   <1  → animation runs FASTER than real life
@@ -1175,8 +1234,12 @@ if not compare_mode:
             st.session_state["stop_play"] = False
             # Precompute fixed axis limits for the full traversal so the
             # camera doesn't drift as the array translates.
-            fx, fy = full_traversal_limits(scen, trail_rev, frame)
-            times_ms_arr = np.linspace(0, total_ms, int(play_frames)).astype(int)
+            fx, fy = full_traversal_limits(
+                scen, trail_rev, frame,
+                t_start_s=seg_start_ms / 1000.0,
+                t_end_s=seg_end_ms / 1000.0)
+            times_ms_arr = np.linspace(seg_start_ms, seg_end_ms,
+                                       int(play_frames)).astype(int)
 
             frames_png: list[bytes] = []
             progress = st.progress(0.0, text="Preparing animation…")
