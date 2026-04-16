@@ -706,8 +706,9 @@ def plot_motion_fast(s: Scenario, t_now_s: float,
         x_span = fixed_xlim[1] - fixed_xlim[0]
         y_span = fixed_ylim[1] - fixed_ylim[0]
     else:
-        x_span = max(60.0, float(pts[..., 0].ptp()) + 300)
-        y_span = max(60.0, float(pts[..., 1].ptp()) + 300)
+        # np.ptp() is the NumPy-2.0-safe form; .ptp() on arrays was removed.
+        x_span = max(60.0, float(np.ptp(pts[..., 0])) + 300)
+        y_span = max(60.0, float(np.ptp(pts[..., 1])) + 300)
 
     # Plot area target: short side ≈ 4", long side scales with data aspect
     # but capped so the figure stays reasonable in the Streamlit column.
