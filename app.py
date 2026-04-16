@@ -1041,62 +1041,72 @@ def plot_hull_section(shape_key: str, beam_m: float, draft_m: float,
     # (x = -B/2, y = 0), going DOWN the port side, around the bottom,
     # up the starboard side, and closing at (B/2, 0). Waterline = y=0;
     # depth is positive downward in this plot (we'll invert y-axis).
+    # Coordinates: x horizontal (port negative, stbd positive),
+    # y = depth-below-waterline (positive downward). ax.invert_yaxis()
+    # later flips this so that on-screen "up" corresponds to "above
+    # waterline".  We trace the outline counter-clockwise in (x, y)
+    # space, starting at port waterline:
+    #   port WL → down port side → port bilge → bottom → stbd bilge →
+    #   up stbd side → stbd WL, closing back to port WL via the top.
     pts = []
     if shape["deadrise"] <= 0.0:
-        # Port side down to turn of bilge
+        # ------------- Flat bottom with rounded bilges -------------
+        # Port bilge: quarter circle centred at (-B/2 + r, T - r).
+        # Start tangent-to-side: radius points in -x direction → θ=π.
+        # End tangent-to-bottom: radius points in +y direction → θ=π/2.
+        # Sweep θ from π DOWN to π/2 (angle decreases).
         pts.append((-B / 2, 0))
         pts.append((-B / 2, T - r))
-        # Port bilge (quarter circle from (-B/2, T-r) to (-B/2+r, T))
-        thetas = np.linspace(math.pi, 1.5 * math.pi, 30)
+        thetas = np.linspace(math.pi, 0.5 * math.pi, 30)
         for th in thetas:
             pts.append((-B / 2 + r + r * math.cos(th),
                         T - r + r * math.sin(th)))
         # Flat bottom
         pts.append((B / 2 - r, T))
-        # Starboard bilge
-        thetas = np.linspace(1.5 * math.pi, 2 * math.pi, 30)
+        # Starboard bilge: centred at (B/2 - r, T - r).
+        # Start tangent-to-bottom: θ = π/2 (radius → +y).
+        # End tangent-to-side: θ = 0 (radius → +x).
+        thetas = np.linspace(0.5 * math.pi, 0.0, 30)
         for th in thetas:
             pts.append((B / 2 - r + r * math.cos(th),
                         T - r + r * math.sin(th)))
-        # Starboard side up to waterline
         pts.append((B / 2, T - r))
         pts.append((B / 2, 0))
     else:
-        # V-bottom with bilge radius
+        # ------------- V-bottom with bilge radius ------------------
         alpha = math.radians(shape["deadrise"])
+        # Half-flat is NOT a flat bottom — it's the horizontal distance
+        # from keel centreline to the turn-of-bilge on each side.
         half_flat = B / 2 - r
-        # Turn-of-bilge depth: T - r (same as flat case, bilge centred there)
-        # Keel depth: T - r + half_flat * tan(α) + r * (1 - cos(α))
-        # (keel sits below the bilge centre by that amount)
-        # Port side down
+        # Port bilge centre is offset outboard of the side by r, and
+        # above (shallower than) the keel. Its centre sits at
+        # (-B/2 + r, T - r) — same as flat case — but the arc ends
+        # tangent to a V-face sloping downward-and-inboard at angle α
+        # below horizontal. The arc therefore sweeps from θ = π
+        # (tangent to vertical side) to θ = π/2 + α (tangent to V-face,
+        # i.e. radius normal to V-face).
+        a0 = math.pi
+        a1 = 0.5 * math.pi + alpha
         pts.append((-B / 2, 0))
         pts.append((-B / 2, T - r))
-        # Port bilge: quarter arc from π to (π - (π/2 - α)) = π/2 + α
-        # Actually: bilge is tangent to side (vertical) and tangent to V-face.
-        # Centre at (-B/2 + r, T - r). Arc from angle π (pointing left)
-        # sweeping to angle 3π/2 - α (pointing down-and-right along the V).
-        a0 = math.pi
-        a1 = 3 * math.pi / 2 - alpha
         thetas = np.linspace(a0, a1, 30)
         for th in thetas:
             pts.append((-B / 2 + r + r * math.cos(th),
                         T - r + r * math.sin(th)))
-        # V-face down to keel, then up
-        # End of port bilge in terms of (x, y):
-        x_end_port = -B / 2 + r + r * math.cos(a1)
+        # V-face from end-of-port-bilge down to keel at x = 0.
+        x_end_port = -B / 2 + r + r * math.cos(a1)   # negative
         y_end_port = T - r + r * math.sin(a1)
-        # V-face travels to keel at (0, y_keel)
-        y_keel = y_end_port + (0 - x_end_port) * math.tan(alpha)
+        y_keel = y_end_port + (-x_end_port) * math.tan(alpha)
         pts.append((0, y_keel))
-        # Starboard V-face
-        x_start_stbd = B / 2 - r - r * math.cos(math.pi + a1 - math.pi)
-        # Actually the stbd bilge starts at the mirror of port bilge end
-        x_start_stbd = -x_end_port
+        # Mirror across x=0 to the starboard turn-of-bilge.
+        x_start_stbd = -x_end_port                    # positive
         y_start_stbd = y_end_port
         pts.append((x_start_stbd, y_start_stbd))
-        # Starboard bilge: mirror arc
-        a0s = 3 * math.pi / 2 + alpha
-        a1s = 2 * math.pi
+        # Starboard bilge: centred at (B/2 - r, T - r). Sweep from the
+        # V-tangent angle (π/2 − α) back to θ = 0 (tangent to vertical
+        # side), going CLOCKWISE in (x, y) so angles decrease.
+        a0s = 0.5 * math.pi - alpha
+        a1s = 0.0
         thetas = np.linspace(a0s, a1s, 30)
         for th in thetas:
             pts.append((B / 2 - r + r * math.cos(th),
