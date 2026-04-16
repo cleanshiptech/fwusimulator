@@ -13,7 +13,13 @@ Key changes vs the previous version:
   - Top-down and side schematics are cached via st.cache_data so they only
     re-render when the scenario geometry changes, not on every slider move.
   - Trail length cap raised to 20 revolutions.
-  - "Play" button that steps through frames to give a movie-like view.
+  - Motion animation uses a "Prepare → Play" pattern: all frames are pre-
+    rendered to PNGs into st.session_state, then played back via st.image()
+    for instant, flicker-free playback. Stop button interrupts either phase.
+  - Hull-frame axis limits are fixed over the full traversal so the camera
+    doesn't shift from frame to frame during playback.
+  - A real-time vs wall-clock scale label tells you how much slower the
+    animation is compared to reality (rotation is ~800 RPM).
 
 Run with:
     streamlit run app.py
@@ -23,6 +29,7 @@ Run with:
 
 from __future__ import annotations
 
+import io
 import math
 import time
 from dataclasses import dataclass, field, asdict
@@ -637,11 +644,17 @@ def simulate_pressure(s: Scenario, t_stop_s: float | None = None
 def plot_motion_fast(s: Scenario, t_now_s: float,
                      trail_revolutions: float = 1.0,
                      frame: str = "Hull frame",
-                     cumulative_strip: np.ndarray | None = None
+                     cumulative_strip: np.ndarray | None = None,
+                     fixed_xlim: tuple[float, float] | None = None,
+                     fixed_ylim: tuple[float, float] | None = None,
                      ) -> plt.Figure:
     """
     Fast render: trails via LineCollection, current footprints via
     PatchCollection. Trails computed by vectorised NumPy.
+
+    If ``fixed_xlim``/``fixed_ylim`` are provided, they override the
+    auto-fit axis limits. This is essential for the pre-rendered
+    animation so the camera doesn't shift from frame to frame.
     """
     rotated = compute_rotated_discs(s)
     phases = [2 * math.pi * i / max(len(rotated), 1) for i in range(len(rotated))]
@@ -791,12 +804,21 @@ def plot_motion_fast(s: Scenario, t_now_s: float,
                     ha="center", va="center", fontsize=9, color="#555")
 
     # Axis limits
-    all_x = list(disc_xs) + [float(pts[..., 0].min()), float(pts[..., 0].max())]
-    all_y = list(disc_ys) + [float(pts[..., 1].min()), float(pts[..., 1].max())]
-    x_lo = min(min(all_x), -half_fw) - 60
-    x_hi = max(max(all_x), half_fw) + 180
-    y_lo = min(min(all_y), y_top) - 60
-    y_hi = max(max(all_y), y_bot) + 60
+    if fixed_xlim is not None:
+        x_lo, x_hi = fixed_xlim
+    else:
+        all_x = list(disc_xs) + [float(pts[..., 0].min()),
+                                 float(pts[..., 0].max())]
+        x_lo = min(min(all_x), -half_fw) - 60
+        x_hi = max(max(all_x), half_fw) + 180
+
+    if fixed_ylim is not None:
+        y_lo, y_hi = fixed_ylim
+    else:
+        all_y = list(disc_ys) + [float(pts[..., 1].min()),
+                                 float(pts[..., 1].max())]
+        y_lo = min(min(all_y), y_top) - 60
+        y_hi = max(max(all_y), y_bot) + 60
 
     ax.set_xlim(x_lo, x_hi)
     ax.set_ylim(y_lo, y_hi)
@@ -810,6 +832,66 @@ def plot_motion_fast(s: Scenario, t_now_s: float,
     )
     ax.grid(True, alpha=0.25)
     return fig
+
+
+def full_traversal_limits(s: Scenario, trail_revolutions: float,
+                          frame: str,
+                          n_samples: int = 60,
+                          pad_mm: float = 60.0
+                          ) -> tuple[tuple[float, float], tuple[float, float]]:
+    """
+    Compute the Hull-frame (or ROV-frame) axis window so that the
+    array and trails remain visible for ALL t in 0..total_time_s.
+
+    This makes the camera static during playback — no shifting.
+    """
+    rotated = compute_rotated_discs(s)
+    phases = [2 * math.pi * i / max(len(rotated), 1) for i in range(len(rotated))]
+    rov_speed_mm_s = s.rov_speed_kn * KNOTS_TO_MPS * 1000.0
+    total_time_s = s.sim_length_mm / max(rov_speed_mm_s, 1e-6)
+
+    rxs_rot = [r[0] for r in rotated]
+    rys_rot = [r[1] for r in rotated]
+    half_fw = max(abs(min(rxs_rot)), abs(max(rxs_rot))) + s.disc_diameter_mm / 2 + 30
+    y_top_rel = min(rys_rot) - s.disc_diameter_mm / 2 - 30
+    y_bot_rel = max(rys_rot) + s.disc_diameter_mm / 2 + 30
+
+    omega = s.rpm * 2 * math.pi / 60.0
+    trail_dur = trail_revolutions * (2 * math.pi / max(omega, 1e-6))
+
+    ts = np.linspace(0.0, total_time_s, max(n_samples, 2))
+    pts = nozzle_trails_vec(s, ts, rotated, phases)   # (T, D, N, 2)
+
+    if frame == "ROV frame":
+        # Trails collapse to a stationary rosette; also include hull array box.
+        rys_np = np.array(rys_rot)
+        aly0 = rys_np.min() - s.disc_diameter_mm / 2
+        array_y_offset_init = -120.0 - aly0
+        array_y_t = array_y_offset_init + rov_speed_mm_s * ts
+        pts = pts.copy()
+        pts[..., 1] -= array_y_t[:, None, None]
+        y_lo = min(float(pts[..., 1].min()), y_top_rel) - pad_mm
+        y_hi = max(float(pts[..., 1].max()), y_bot_rel) + pad_mm
+    else:
+        # Hull frame: array slides from y_start to y_end; include the
+        # trail extent too (which lags behind by up to trail_dur).
+        array_leading_y = min(rys_rot) - s.disc_diameter_mm / 2
+        margin_mm = 120.0
+        array_y_offset_init = -margin_mm - array_leading_y
+        y_top_t0 = y_top_rel + array_y_offset_init
+        y_bot_tend = y_bot_rel + array_y_offset_init \
+            + rov_speed_mm_s * total_time_s
+        # trails extend up to trail_dur behind the current array position;
+        # the backmost trail tail ≈ current array_y - rov_speed*trail_dur.
+        trail_back = rov_speed_mm_s * trail_dur
+        y_lo = min(y_top_t0, y_top_t0 - trail_back) - pad_mm
+        y_hi = y_bot_tend + pad_mm
+
+    all_x = list(rxs_rot) + [float(pts[..., 0].min()), float(pts[..., 0].max())]
+    x_lo = min(min(all_x), -half_fw) - pad_mm
+    x_hi = max(max(all_x), half_fw) + (180.0 if frame == "Hull frame" else pad_mm)
+
+    return (x_lo, x_hi), (y_lo, y_hi)
 
 
 # -----------------------------------------------------------------------------
@@ -941,23 +1023,56 @@ if not compare_mode:
                 help="Hull frame: array translates, hull is stationary. "
                      "ROV frame: array is stationary; trails look like rosettes.")
 
-        # Play controls
-        pc1, pc2, pc3, pc4 = st.columns([1, 1, 1.3, 1.3])
-        play = pc1.button("▶ Play", key="play_btn",
-                          help="Animate the traversal as a flip-book.")
+        # ----- Animation: Prepare → Play pattern ---------------------
+        # Render all frames ONCE into PNG bytes cached in session_state,
+        # then play them back via st.image() for instant, shift-free
+        # playback. Hull-frame axes are fixed over the full traversal.
+        pc1, pc2, pc3, pc4 = st.columns([1.2, 1.2, 1.2, 1.3])
+        play_frames = pc1.slider(
+            "Animation frames", 20, 200, 80, step=10, key="play_frames",
+            help="More frames = smoother animation, but slower to prepare.")
         play_speed = pc2.select_slider(
             "Speed", options=["0.25x", "0.5x", "1x", "2x", "4x"],
-            value="1x", key="play_speed")
-        play_frames = pc3.slider(
-            "Animation frames", 20, 200, 80, step=10, key="play_frames",
-            help="More frames = smoother but slower.")
-        show_underlay_live = pc4.checkbox(
-            "Underlay during play",
-            value=False, key="underlay_live",
-            help="Show cumulative cleaning during animation. "
-                 "Slow — only enable for short traversals.")
+            value="1x", key="play_speed",
+            help="Wall-clock speed multiplier relative to the 'slowed down' "
+                 "animation baseline. 1x = one frame every ~40 ms.")
+        prepare_underlay = pc3.checkbox(
+            "Underlay during prepare", value=False, key="prepare_underlay",
+            help="Include cumulative cleaning heatmap on each frame. "
+                 "Much slower to prepare — only for short traversals.")
+        clear_anim = pc4.button(
+            "Clear animation cache", key="clear_anim_btn",
+            help="Remove cached frames (e.g. after changing the scenario).")
+        if clear_anim:
+            st.session_state.pop("anim_frames", None)
 
-        # Underlay is opt-in via button (so scrubbing stays fast)
+        ac1, ac2, ac3 = st.columns([1.2, 1.2, 2.4])
+        prepare = ac1.button(
+            "🎞 Prepare animation", key="prepare_btn",
+            help="Pre-render all frames into memory. Playback is then instant.")
+        play_cached = ac2.button(
+            "▶ Play", key="play_btn",
+            help="Play the cached frames. Prepare first if no cache exists.")
+        stop = ac3.button(
+            "■ Stop", key="stop_btn",
+            help="Interrupt preparation or playback.")
+        if stop:
+            st.session_state["stop_play"] = True
+
+        # Build cache key so cache invalidates when any input changes
+        cache_key = (
+            scenario_full_key(scen),
+            round(float(trail_rev), 4),
+            frame,
+            int(play_frames),
+            bool(prepare_underlay),
+        )
+        cached_anim = st.session_state.get("anim_frames")
+        if cached_anim and cached_anim.get("key") != cache_key:
+            st.session_state.pop("anim_frames", None)
+            cached_anim = None
+
+        # ----- Underlay (static, opt-in) -----------------------------
         bc1, bc2 = st.columns([1, 2])
         compute_underlay = bc1.button(
             "Compute underlay",
@@ -995,7 +1110,43 @@ if not compare_mode:
                 f"(re-click *Compute underlay* after moving the slider)."
             )
 
-        # Plot current snapshot
+        # ----- Scale info --------------------------------------------
+        # The animation covers total_time_s of real time, divided into
+        # play_frames steps. Each frame represents total_time_s/frames of
+        # reality. Wall-clock playback rate is governed by frame_wall_dt.
+        speed_map = {"0.25x": 0.25, "0.5x": 0.5, "1x": 1.0,
+                     "2x": 2.0, "4x": 4.0}
+        speed = speed_map[play_speed]
+        # Baseline: aim for ~40 ms per frame on screen at 1x.
+        baseline_wall_dt = 0.040
+        frame_wall_dt = baseline_wall_dt / speed
+        real_dt_per_frame = total_time_s / max(play_frames, 1)
+        # Ratio of wall time to real time for the same animation segment.
+        #   >1  → animation runs SLOWER than real life
+        #   <1  → animation runs FASTER than real life
+        ratio = frame_wall_dt / max(real_dt_per_frame, 1e-9)
+        if ratio >= 1.0:
+            scale_word = f"~{ratio:.1f}× slower than real time"
+        else:
+            scale_word = f"~{1.0/ratio:.1f}× faster than real time"
+        disc_period_ms = 60000.0 / max(scen.rpm, 1)
+        rev_per_frame = real_dt_per_frame * 1000.0 / disc_period_ms
+        # Aliasing warning if each frame advances by ≥ half a disc revolution
+        alias_note = ""
+        if rev_per_frame > 0.5:
+            alias_note = (f" ⚠ Each frame advances by {rev_per_frame:.2f} "
+                          f"disc revolutions — the rotation will look "
+                          f"stroboscopic. Increase frames or shorten the "
+                          f"traversal for smooth spin.")
+        st.caption(
+            f"⏱ Playback scale at {play_speed}: **{scale_word}** "
+            f"(each frame = {real_dt_per_frame*1000:.1f} ms of reality, "
+            f"shown for {frame_wall_dt*1000:.0f} ms on screen). "
+            f"Discs spin at {scen.rpm} RPM (one rev every "
+            f"{disc_period_ms:.1f} ms)." + alias_note
+        )
+
+        # ----- Render current snapshot (always shown) ---------------
         snapshot_slot = st.empty()
         snapshot_slot.pyplot(
             plot_motion_fast(scen, t_ms / 1000.0,
@@ -1004,33 +1155,84 @@ if not compare_mode:
                              cumulative_strip=cumulative),
             clear_figure=True)
 
-        # Animation (Play)
-        if play:
-            speed_map = {"0.25x": 0.25, "0.5x": 0.5, "1x": 1.0,
-                         "2x": 2.0, "4x": 4.0}
-            speed = speed_map[play_speed]
-            # Each frame represents total_time_s / play_frames of real time.
-            # Wall-clock frame period (target) = that real time / speed.
-            frame_wall_dt = (total_time_s / play_frames) / speed
-            # Clamp to 15..200 ms for a sane flip-book
-            frame_wall_dt = max(0.015, min(frame_wall_dt, 0.2))
+        # ----- Prepare phase ----------------------------------------
+        if prepare:
+            st.session_state["stop_play"] = False
+            # Precompute fixed axis limits for the full traversal so the
+            # camera doesn't drift as the array translates.
+            fx, fy = full_traversal_limits(scen, trail_rev, frame)
+            times_ms_arr = np.linspace(0, total_ms, int(play_frames)).astype(int)
 
-            times_ms = np.linspace(0, total_ms, play_frames).astype(int)
-            for i, tm in enumerate(times_ms):
+            frames_png: list[bytes] = []
+            progress = st.progress(0.0, text="Preparing animation…")
+            interrupted = False
+            t_prep_start = time.perf_counter()
+            for i, tm in enumerate(times_ms_arr):
+                if st.session_state.get("stop_play"):
+                    interrupted = True
+                    break
                 t_sec = tm / 1000.0
-                cum_play = None
-                if show_underlay_live and frame == "Hull frame":
-                    cum_play, _m, _c = simulate_pressure(scen, t_stop_s=t_sec)
-                fig_anim = plot_motion_fast(
+                cum_f = None
+                if prepare_underlay and frame == "Hull frame":
+                    cum_f, _m, _c = simulate_pressure(scen, t_stop_s=max(t_sec, 1e-6))
+                fig_f = plot_motion_fast(
                     scen, t_sec,
                     trail_revolutions=trail_rev,
                     frame=frame,
-                    cumulative_strip=cum_play)
-                snapshot_slot.pyplot(fig_anim, clear_figure=True)
-                plt.close(fig_anim)
-                time.sleep(frame_wall_dt)
-            # Leave slider at the final frame
-            st.session_state.t_ms = int(times_ms[-1])
+                    cumulative_strip=cum_f,
+                    fixed_xlim=fx, fixed_ylim=fy)
+                buf = io.BytesIO()
+                fig_f.savefig(buf, format="png", dpi=110,
+                              bbox_inches="tight")
+                plt.close(fig_f)
+                frames_png.append(buf.getvalue())
+                progress.progress(
+                    (i + 1) / len(times_ms_arr),
+                    text=f"Preparing animation… {i+1}/{len(times_ms_arr)}")
+            prep_wall = time.perf_counter() - t_prep_start
+            progress.empty()
+
+            if not interrupted:
+                st.session_state["anim_frames"] = {
+                    "key": cache_key,
+                    "frames": frames_png,
+                    "times_ms": times_ms_arr.tolist(),
+                    "total_time_s": total_time_s,
+                    "prep_wall_s": prep_wall,
+                }
+                st.success(
+                    f"Cached {len(frames_png)} frames in "
+                    f"{prep_wall:.1f} s. Click ▶ Play.")
+            else:
+                st.warning(
+                    f"Preparation stopped after {len(frames_png)} frames.")
+            st.session_state["stop_play"] = False
+
+        # ----- Playback phase ---------------------------------------
+        cached_anim = st.session_state.get("anim_frames")
+        if play_cached:
+            if not cached_anim or cached_anim.get("key") != cache_key:
+                st.warning(
+                    "No cached animation matches the current settings. "
+                    "Click *Prepare animation* first.")
+            else:
+                st.session_state["stop_play"] = False
+                frames_png = cached_anim["frames"]
+                times_ms_arr = cached_anim["times_ms"]
+                for i, (png, tm) in enumerate(zip(frames_png, times_ms_arr)):
+                    if st.session_state.get("stop_play"):
+                        break
+                    snapshot_slot.image(png, use_column_width=True)
+                    time.sleep(frame_wall_dt)
+                # Leave slider at the final frame
+                st.session_state.t_ms = int(times_ms_arr[-1])
+                st.session_state["stop_play"] = False
+
+        if cached_anim and cached_anim.get("key") == cache_key:
+            st.caption(
+                f"✅ Animation cached: {len(cached_anim['frames'])} frames "
+                f"({sum(len(f) for f in cached_anim['frames'])/1024:.0f} kB). "
+                f"Prep took {cached_anim.get('prep_wall_s', 0):.1f} s.")
 
         st.caption(
             f"Total traversal time: {total_time_s*1000:.0f} ms "
