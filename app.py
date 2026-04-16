@@ -933,6 +933,209 @@ def full_traversal_limits(s: Scenario, trail_revolutions: float,
 
 
 # -----------------------------------------------------------------------------
+# Hull simulation helpers
+# -----------------------------------------------------------------------------
+# Three hull-shape presets parametrising the midship section. Each entry
+# gives:
+#   Cm         — midship coefficient (ratio of midship section area to B*T)
+#   r_rel      — bilge radius as a fraction of beam B
+#   deadrise   — V-bottom deadrise angle in degrees (0 for flat bottoms)
+#   k_side     — side-surface correction factor (≈ 1 for flat sides,
+#                >1 for flared/curved sides)
+#   label      — short UI label
+#   blurb      — one-line description
+HULL_SHAPES = {
+    "full": {
+        "Cm": 0.98, "r_rel": 0.10, "deadrise": 0.0,
+        "k_side": 1.00,
+        "label": "Full (block)",
+        "blurb": "Flat bottom, boxy — container, bulk carrier, large tanker.",
+    },
+    "typical": {
+        "Cm": 0.88, "r_rel": 0.30, "deadrise": 0.0,
+        "k_side": 1.02,
+        "label": "Typical",
+        "blurb": "Rounded bilge — general cargo, product tanker, ferry.",
+    },
+    "fine": {
+        "Cm": 0.72, "r_rel": 0.15, "deadrise": 20.0,
+        "k_side": 1.05,
+        "label": "Fine (V-keel)",
+        "blurb": "Deep-V with sharp keel — naval, fast ferry, yacht.",
+    },
+}
+
+
+def hull_section_perimeter_mm(beam_mm: float, draft_mm: float,
+                              shape_key: str) -> float:
+    """
+    Approximate perimeter (mm) of the midship cross-section's bottom
+    (i.e. everything from port waterline, down around the keel, up to
+    starboard waterline, excluding the two vertical side segments).
+
+    This is what the cleaning robot traverses across the bottom of the
+    hull on a single sweep at midship.
+    """
+    shape = HULL_SHAPES[shape_key]
+    r = shape["r_rel"] * beam_mm
+    if shape["deadrise"] <= 0.0:
+        # Rectangular bottom with two quarter-circle bilges.
+        flat = max(beam_mm - 2 * r, 0.0)
+        # two quarter arcs = half circumference
+        arcs = math.pi * r
+        return flat + arcs
+    # V-bottom with bilge radius r and deadrise α
+    alpha = math.radians(shape["deadrise"])
+    half_flat = max(beam_mm / 2 - r, 0.0)
+    v_leg = half_flat / max(math.cos(alpha), 1e-6)
+    arcs = math.pi * r  # two quarter bilges
+    return 2 * v_leg + arcs
+
+
+def hull_wetted_areas(loa_m: float, beam_m: float, draft_m: float,
+                      shape_key: str) -> dict:
+    """
+    First-order wetted-surface-area model for cleaning planning.
+
+    Returns a dict with ``side_port``, ``side_starboard``, ``bottom``
+    and ``total`` in m².  LOA, beam and draft are in metres.
+
+    Assumptions:
+      - Side area per side ≈ LOA × draft × k_side
+      - Bottom area ≈ LOA × midship_section_perimeter
+      - End-effects (bow/stern curvature) are absorbed into a
+        longitudinal correction factor Cl = 0.96 (fine), 1.00 (typical),
+        1.02 (full) — small tweak that captures plumb vs raked bow.
+    """
+    shape = HULL_SHAPES[shape_key]
+    C_l = {"full": 1.02, "typical": 1.00, "fine": 0.96}[shape_key]
+    side_area = loa_m * draft_m * shape["k_side"] * C_l
+    perim_m = hull_section_perimeter_mm(beam_m * 1000, draft_m * 1000,
+                                        shape_key) / 1000.0
+    bottom_area = loa_m * perim_m * C_l
+    return {
+        "side_port": side_area,
+        "side_starboard": side_area,
+        "bottom": bottom_area,
+        "total": 2 * side_area + bottom_area,
+        "section_perim_m": perim_m,
+        "C_l": C_l,
+    }
+
+
+def plot_hull_section(shape_key: str, beam_m: float, draft_m: float,
+                      title: str | None = None,
+                      figsize: tuple[float, float] = (3.0, 2.4)
+                      ) -> plt.Figure:
+    """
+    Draw the midship cross-section of a hull shape, with waterline.
+    Used as a visual selection card in the Hull simulation tab.
+    """
+    shape = HULL_SHAPES[shape_key]
+    fig, ax = plt.subplots(figsize=figsize)
+    B = beam_m
+    T = draft_m
+    r = shape["r_rel"] * B
+
+    # Build outline as a list of (x, y) points starting at port waterline
+    # (x = -B/2, y = 0), going DOWN the port side, around the bottom,
+    # up the starboard side, and closing at (B/2, 0). Waterline = y=0;
+    # depth is positive downward in this plot (we'll invert y-axis).
+    pts = []
+    if shape["deadrise"] <= 0.0:
+        # Port side down to turn of bilge
+        pts.append((-B / 2, 0))
+        pts.append((-B / 2, T - r))
+        # Port bilge (quarter circle from (-B/2, T-r) to (-B/2+r, T))
+        thetas = np.linspace(math.pi, 1.5 * math.pi, 30)
+        for th in thetas:
+            pts.append((-B / 2 + r + r * math.cos(th),
+                        T - r + r * math.sin(th)))
+        # Flat bottom
+        pts.append((B / 2 - r, T))
+        # Starboard bilge
+        thetas = np.linspace(1.5 * math.pi, 2 * math.pi, 30)
+        for th in thetas:
+            pts.append((B / 2 - r + r * math.cos(th),
+                        T - r + r * math.sin(th)))
+        # Starboard side up to waterline
+        pts.append((B / 2, T - r))
+        pts.append((B / 2, 0))
+    else:
+        # V-bottom with bilge radius
+        alpha = math.radians(shape["deadrise"])
+        half_flat = B / 2 - r
+        # Turn-of-bilge depth: T - r (same as flat case, bilge centred there)
+        # Keel depth: T - r + half_flat * tan(α) + r * (1 - cos(α))
+        # (keel sits below the bilge centre by that amount)
+        # Port side down
+        pts.append((-B / 2, 0))
+        pts.append((-B / 2, T - r))
+        # Port bilge: quarter arc from π to (π - (π/2 - α)) = π/2 + α
+        # Actually: bilge is tangent to side (vertical) and tangent to V-face.
+        # Centre at (-B/2 + r, T - r). Arc from angle π (pointing left)
+        # sweeping to angle 3π/2 - α (pointing down-and-right along the V).
+        a0 = math.pi
+        a1 = 3 * math.pi / 2 - alpha
+        thetas = np.linspace(a0, a1, 30)
+        for th in thetas:
+            pts.append((-B / 2 + r + r * math.cos(th),
+                        T - r + r * math.sin(th)))
+        # V-face down to keel, then up
+        # End of port bilge in terms of (x, y):
+        x_end_port = -B / 2 + r + r * math.cos(a1)
+        y_end_port = T - r + r * math.sin(a1)
+        # V-face travels to keel at (0, y_keel)
+        y_keel = y_end_port + (0 - x_end_port) * math.tan(alpha)
+        pts.append((0, y_keel))
+        # Starboard V-face
+        x_start_stbd = B / 2 - r - r * math.cos(math.pi + a1 - math.pi)
+        # Actually the stbd bilge starts at the mirror of port bilge end
+        x_start_stbd = -x_end_port
+        y_start_stbd = y_end_port
+        pts.append((x_start_stbd, y_start_stbd))
+        # Starboard bilge: mirror arc
+        a0s = 3 * math.pi / 2 + alpha
+        a1s = 2 * math.pi
+        thetas = np.linspace(a0s, a1s, 30)
+        for th in thetas:
+            pts.append((B / 2 - r + r * math.cos(th),
+                        T - r + r * math.sin(th)))
+        pts.append((B / 2, T - r))
+        pts.append((B / 2, 0))
+
+    xs = [p[0] for p in pts]
+    ys = [p[1] for p in pts]
+    ax.fill(xs, ys, color="#cfd8dc", edgecolor="#263238", linewidth=1.4)
+
+    # Waterline
+    wl_x = max(abs(min(xs)), abs(max(xs))) * 1.2
+    ax.plot([-wl_x, wl_x], [0, 0], color="#0288d1",
+            lw=1.0, ls="--", alpha=0.8)
+    ax.text(wl_x * 0.95, -0.02 * max(T, 1), "WL",
+            fontsize=7, color="#0288d1", ha="right", va="bottom")
+
+    # Dimensions
+    ax.annotate(f"B = {B:.1f} m",
+                xy=(0, -0.04 * max(T, 1)), ha="center", va="bottom",
+                fontsize=8, color="#333")
+    ax.annotate(f"T = {T:.1f} m",
+                xy=(-wl_x * 0.98, T / 2), ha="left", va="center",
+                fontsize=8, color="#333", rotation=90)
+
+    ax.set_aspect("equal")
+    ax.invert_yaxis()       # so draft goes downwards visually
+    ax.set_xlim(-wl_x, wl_x)
+    ax.set_ylim(T * 1.25, -T * 0.15)
+    ax.set_xticks([]); ax.set_yticks([])
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+    ax.set_title(title or shape["label"], fontsize=10)
+    fig.tight_layout(pad=0.2)
+    return fig
+
+
+# -----------------------------------------------------------------------------
 # Result renderer (KPI cards + heatmaps) — unchanged
 # -----------------------------------------------------------------------------
 def render_result(s: Scenario, strip: np.ndarray, m: dict,
@@ -1012,21 +1215,57 @@ if not compare_mode:
         st.divider()
         scen = scenario_controls("single", Scenario(), st.sidebar)
 
-    left, right = st.columns([1.2, 1.0])
-    with left:
-        st.subheader("Top-down view")
-        st.pyplot(plot_topdown(scen), clear_figure=False)
-    with right:
-        st.subheader("Side view (one disc)")
-        st.pyplot(plot_side(scen), clear_figure=False)
+    tab_impact, tab_motion, tab_hull = st.tabs(
+        ["Impact simulation", "Motion simulation", "Hull simulation"])
 
-    st.divider()
+    # =============================================================
+    # TAB 1 — Impact simulation
+    # =============================================================
+    with tab_impact:
+        left, right = st.columns([1.2, 1.0])
+        with left:
+            st.subheader("Top-down view")
+            st.pyplot(plot_topdown(scen), clear_figure=False)
+        with right:
+            st.subheader("Side view (one disc)")
+            st.pyplot(plot_side(scen), clear_figure=False)
 
-    # ------------------------------------------------------------------
-    # Motion visualisation (fast)
-    # ------------------------------------------------------------------
-    with st.expander("Motion visualisation (time snapshot + nozzle trails)",
-                     expanded=False):
+        st.divider()
+        if st.button("Run full simulation", type="primary"):
+            with st.spinner("Sweeping the array across the hull…"):
+                strip, metrics, core_box = simulate_pressure(scen)
+            # Cache result so the Hull tab can read cleaning-rate KPIs.
+            st.session_state["last_impact_result"] = {
+                "scen_key": scenario_full_key(scen),
+                "strip": strip,
+                "metrics": metrics,
+                "core_box": core_box,
+                "rov_speed_kn": scen.rov_speed_kn,
+                "array_span_x_mm": metrics["array_span_x_mm"],
+                "array_span_y_mm": metrics["array_span_y_mm"],
+                "coverage_pct": metrics["coverage_pct"],
+            }
+            render_result(scen, strip, metrics, core_box, st)
+        else:
+            cached_impact = st.session_state.get("last_impact_result")
+            if (cached_impact and
+                    cached_impact.get("scen_key") == scenario_full_key(scen)):
+                st.caption(
+                    "Showing cached result for current scenario. Click "
+                    "**Run full simulation** to re-run.")
+                render_result(scen, cached_impact["strip"],
+                              cached_impact["metrics"],
+                              cached_impact["core_box"], st)
+            else:
+                st.info(
+                    "Adjust parameters in the sidebar, then click "
+                    "**Run full simulation**. The cleaned-area KPI here "
+                    "feeds the Hull simulation tab.")
+
+    # =============================================================
+    # TAB 2 — Motion simulation
+    # =============================================================
+    with tab_motion:
         rov_speed_mm_s = scen.rov_speed_kn * KNOTS_TO_MPS * 1000.0
         total_time_s = scen.sim_length_mm / max(rov_speed_mm_s, 1e-6)
         total_ms = int(total_time_s * 1000)
@@ -1324,13 +1563,153 @@ if not compare_mode:
             f"At 20 rev, trail covers {20*60000/max(scen.rpm,1):.0f} ms."
         )
 
-    st.divider()
-    if st.button("Run full simulation", type="primary"):
-        with st.spinner("Sweeping the array across the hull…"):
-            strip, metrics, core_box = simulate_pressure(scen)
-        render_result(scen, strip, metrics, core_box, st)
-    else:
-        st.info("Adjust parameters in the sidebar, then click **Run full simulation**.")
+    # =============================================================
+    # TAB 3 — Hull simulation
+    # =============================================================
+    with tab_hull:
+        st.subheader("Vessel-level cleaning time estimate")
+        st.caption(
+            "Given the Impact-tab cleaning-rate and a hull geometry, "
+            "estimate how long it takes to clean each side of the vessel.")
+
+        cached_impact = st.session_state.get("last_impact_result")
+        if not cached_impact or cached_impact.get("scen_key") != scenario_full_key(scen):
+            st.warning(
+                "⚠ No impact-sim result cached for the current scenario. "
+                "Go to the **Impact simulation** tab and click "
+                "**Run full simulation** first — the cleaned-area KPI is "
+                "used here to compute the per-side time.")
+            st.stop()
+
+        # ----- Cleaning-rate derivation ---------------------------
+        # Area cleaned per unit wall time =
+        #     array_effective_width [m]  ×  ROV speed [m/s]  ×  coverage
+        # where coverage is the fraction of cells within the swept strip
+        # that exceed the clean threshold (from the Impact sim).
+        array_span_x_mm = float(cached_impact["array_span_x_mm"])
+        coverage_frac = float(cached_impact["coverage_pct"]) / 100.0
+        rov_speed_mps = float(cached_impact["rov_speed_kn"]) * KNOTS_TO_MPS
+        # Effective width: the swept strip's across-track extent.
+        array_width_m = array_span_x_mm / 1000.0
+        # Gross footprint swept per second, m²/s
+        footprint_rate_m2_s = array_width_m * rov_speed_mps
+        # Effective *cleaned* rate = footprint × cleaned-fraction
+        cleaning_rate_m2_s = footprint_rate_m2_s * coverage_frac
+        cleaning_rate_m2_h = cleaning_rate_m2_s * 3600.0
+
+        rate_c1, rate_c2, rate_c3 = st.columns(3)
+        rate_c1.metric(
+            "Array effective width",
+            f"{array_width_m:.2f} m",
+            help="Across-track span of the swept strip at the current yaw.")
+        rate_c2.metric(
+            "ROV speed",
+            f"{rov_speed_mps:.2f} m/s",
+            help=f"= {cached_impact['rov_speed_kn']:.2f} kn")
+        rate_c3.metric(
+            "Cleaning rate",
+            f"{cleaning_rate_m2_h:.0f} m²/h",
+            help=f"Footprint {footprint_rate_m2_s:.2f} m²/s × "
+                 f"coverage {coverage_frac*100:.1f}%.")
+
+        st.divider()
+
+        # ----- Vessel inputs --------------------------------------
+        st.markdown("**Vessel particulars**")
+        vin_c1, vin_c2, vin_c3 = st.columns(3)
+        loa_m = vin_c1.number_input(
+            "LOA (m)", min_value=20.0, max_value=450.0, value=200.0,
+            step=5.0, key="hull_loa",
+            help="Length overall of the vessel.")
+        beam_m = vin_c2.number_input(
+            "Beam (m)", min_value=4.0, max_value=75.0, value=32.0,
+            step=1.0, key="hull_beam",
+            help="Maximum breadth at the waterline.")
+        draft_m = vin_c3.number_input(
+            "Draft (m)", min_value=1.0, max_value=25.0, value=12.0,
+            step=0.5, key="hull_draft",
+            help="Vertical distance from waterline to keel.")
+
+        # ----- Hull-shape selection (visual cards) -----------------
+        st.markdown("**Midship cross-section**")
+        shape_keys = ["full", "typical", "fine"]
+        shape_cols = st.columns(3)
+        for key, col in zip(shape_keys, shape_cols):
+            with col:
+                fig_h = plot_hull_section(key, beam_m, draft_m,
+                                          title=HULL_SHAPES[key]["label"])
+                st.pyplot(fig_h, clear_figure=True)
+                st.caption(HULL_SHAPES[key]["blurb"])
+
+        shape_labels = {k: HULL_SHAPES[k]["label"] for k in shape_keys}
+        shape_key = st.radio(
+            "Select hull shape",
+            shape_keys,
+            format_func=lambda k: shape_labels[k],
+            horizontal=True,
+            key="hull_shape_radio",
+            help="The shape drives the midship perimeter and therefore "
+                 "the bottom area.")
+
+        st.divider()
+
+        # ----- Area & time computation ----------------------------
+        areas = hull_wetted_areas(loa_m, beam_m, draft_m, shape_key)
+        side_time_s = areas["side_port"] / max(cleaning_rate_m2_s, 1e-9)
+        bottom_time_s = areas["bottom"] / max(cleaning_rate_m2_s, 1e-9)
+        total_time_s_hull = (areas["side_port"] + areas["side_starboard"]
+                             + areas["bottom"]) / max(cleaning_rate_m2_s, 1e-9)
+
+        def _fmt_hm(seconds: float) -> str:
+            hours = seconds / 3600.0
+            if hours < 1.0:
+                return f"{seconds/60:.0f} min"
+            whole_h = int(hours)
+            min_left = int(round((hours - whole_h) * 60))
+            if min_left == 60:
+                whole_h += 1
+                min_left = 0
+            return f"{whole_h} h {min_left:02d} min"
+
+        st.markdown("**Per-side wetted area and cleaning time**")
+        out_c1, out_c2, out_c3, out_c4 = st.columns(4)
+        out_c1.metric(
+            "Port side",
+            f"{areas['side_port']:.0f} m²",
+            help=_fmt_hm(side_time_s))
+        out_c2.metric(
+            "Starboard side",
+            f"{areas['side_starboard']:.0f} m²",
+            help=_fmt_hm(side_time_s))
+        out_c3.metric(
+            "Bottom",
+            f"{areas['bottom']:.0f} m²",
+            help=_fmt_hm(bottom_time_s))
+        out_c4.metric(
+            "Total wetted area",
+            f"{areas['total']:.0f} m²",
+            help="Sum of both sides + bottom (excludes bow, stern, "
+                 "superstructure, appendages).")
+
+        time_c1, time_c2, time_c3, time_c4 = st.columns(4)
+        time_c1.metric("Port side time", _fmt_hm(side_time_s))
+        time_c2.metric("Starboard side time", _fmt_hm(side_time_s))
+        time_c3.metric("Bottom time", _fmt_hm(bottom_time_s))
+        time_c4.metric("**Total cleaning time**",
+                       _fmt_hm(total_time_s_hull))
+
+        st.caption(
+            f"Midship section perimeter = {areas['section_perim_m']:.2f} m "
+            f"(beam {beam_m:.1f} m, draft {draft_m:.1f} m, "
+            f"shape **{HULL_SHAPES[shape_key]['label']}**). "
+            f"Side area per side ≈ LOA × draft × k_side × C_L = "
+            f"{loa_m:.0f} × {draft_m:.1f} × "
+            f"{HULL_SHAPES[shape_key]['k_side']:.2f} × {areas['C_l']:.2f} "
+            f"= {areas['side_port']:.0f} m². Bottom area ≈ LOA × "
+            f"perimeter × C_L = {areas['bottom']:.0f} m². "
+            "Assumes continuous, uninterrupted cleaning at the Impact-tab "
+            "rate; real-world operations include docking, repositioning, "
+            "overlap, and transit overhead.")
 
 else:
     with st.sidebar:
