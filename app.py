@@ -1,27 +1,19 @@
 """
-FWU Coverage Simulator
-======================
-Streamlit app to simulate hull-cleaning coverage of the C-Leanship ROV
-flushing and washing unit (FWU).
+FWU Coverage Simulator — performance-optimised motion viz.
 
-Hull is discretised on a 1x1 cm grid. For each time step every nozzle
-deposits its instantaneous jet pressure (bar) onto the cells inside its
-footprint, multiplied by dt. The accumulated quantity per cell is therefore
-**integrated pressure exposure** in units of bar-seconds (bar*s).
-
-Features
---------
-* Disc and nozzle geometry live in sidebar sliders.
-* Array yaw angle: rotates the array relative to the ROV travel direction.
-* Steady-state core: KPIs are measured only on the portion of the hull that
-  the full array has swept over, so the entering/exiting transients are
-  excluded from the "untouched area" figure.
-* Single-scenario mode (one sidebar) and compare-scenarios mode (two full
-  parameter sets A and B, shown side by side).
-* Motion visualisation: scrub a time slider to see disc, nozzle and
-  impact-spot positions with nozzle-trail streaks and optional cumulative
-  cleaning heatmap. Choose between hull frame (ROV moving) and ROV frame
-  (array stationary, hull scrolling past) for intuition.
+Key changes vs the previous version:
+  - plot_motion is fully vectorised. Trails are computed with NumPy
+    broadcasting instead of Python loops over time samples × discs × nozzles.
+  - Trails are drawn as a single LineCollection instead of per-segment plot()
+    calls (~50-100x faster for long trails).
+  - Current footprints are drawn as a single PatchCollection.
+  - The cumulative cleaning underlay is gated behind a button and cached in
+    session_state, so scrubbing the time slider doesn't re-run the pressure
+    simulation each time.
+  - Top-down and side schematics are cached via st.cache_data so they only
+    re-render when the scenario geometry changes, not on every slider move.
+  - Trail length cap raised to 20 revolutions.
+  - "Play" button that steps through frames to give a movie-like view.
 
 Run with:
     streamlit run app.py
@@ -32,6 +24,7 @@ Run with:
 from __future__ import annotations
 
 import math
+import time
 from dataclasses import dataclass, field, asdict
 from copy import deepcopy
 
@@ -39,6 +32,7 @@ import matplotlib.patches as mpatches
 import matplotlib.pyplot as plt
 import numpy as np
 import streamlit as st
+from matplotlib.collections import LineCollection, PatchCollection
 
 # -----------------------------------------------------------------------------
 # Page setup
@@ -110,6 +104,21 @@ class Scenario:
             self.nozzle_radius_mm
             - self.standoff_mm * math.tan(math.radians(self.nozzle_cant_deg)),
         )
+
+
+def scenario_key(s: Scenario) -> tuple:
+    """Hashable key for caching — only geometry-affecting params."""
+    return (s.array_width_mm, s.n_row1, s.n_row2, s.disc_pitch_mm,
+            s.row_pitch_mm, s.yaw_deg, s.disc_diameter_mm, s.n_nozzles,
+            s.nozzle_radius_mm, s.nozzle_cant_deg, s.standoff_mm,
+            s.counter_rotate, s.pressure_bar, s.footprint_mode,
+            s.footprint_dia_mm_override)
+
+
+def scenario_full_key(s: Scenario) -> tuple:
+    """Full hashable key — all params that affect simulation output."""
+    return (*scenario_key(s), s.rpm, s.rov_speed_kn, s.pressure_profile,
+            s.sim_length_mm, s.clean_threshold, s.steady_state_only)
 
 
 # -----------------------------------------------------------------------------
@@ -260,9 +269,17 @@ def compute_rotated_discs(s: Scenario) -> list[tuple[float, float, int]]:
 
 
 # -----------------------------------------------------------------------------
-# Top-down schematic
+# Top-down schematic (cached — regenerated only when geometry changes)
 # -----------------------------------------------------------------------------
-def plot_topdown(s: Scenario, title: str = "Top-down view") -> plt.Figure:
+@st.cache_data(show_spinner=False)
+def plot_topdown_cached(key: tuple, _scen_bytes: bytes,
+                        title: str = "Top-down view") -> plt.Figure:
+    import pickle
+    s: Scenario = pickle.loads(_scen_bytes)
+    return _plot_topdown_impl(s, title)
+
+
+def _plot_topdown_impl(s: Scenario, title: str) -> plt.Figure:
     discs = disc_layout(s)
     cx, cy = 0.0, s.row_pitch_mm / 2.0
     yaw_rad = math.radians(s.yaw_deg)
@@ -316,10 +333,21 @@ def plot_topdown(s: Scenario, title: str = "Top-down view") -> plt.Figure:
     return fig
 
 
+def plot_topdown(s: Scenario, title: str = "Top-down view") -> plt.Figure:
+    import pickle
+    return plot_topdown_cached(scenario_key(s), pickle.dumps(s), title)
+
+
 # -----------------------------------------------------------------------------
-# Side cross-section
+# Side cross-section (cached)
 # -----------------------------------------------------------------------------
-def plot_side(s: Scenario) -> plt.Figure:
+@st.cache_data(show_spinner=False)
+def plot_side_cached(key: tuple, _scen_bytes: bytes) -> plt.Figure:
+    import pickle
+    return _plot_side_impl(pickle.loads(_scen_bytes))
+
+
+def _plot_side_impl(s: Scenario) -> plt.Figure:
     fig, ax = plt.subplots(figsize=(5.5, 3.4))
     ax.axhline(0, color="#555", lw=1.5)
     ax.text(s.impact_radius_mm() * 1.1, -3, "hull", color="#555", fontsize=8)
@@ -355,6 +383,11 @@ def plot_side(s: Scenario) -> plt.Figure:
     return fig
 
 
+def plot_side(s: Scenario) -> plt.Figure:
+    import pickle
+    return plot_side_cached(scenario_key(s), pickle.dumps(s))
+
+
 # -----------------------------------------------------------------------------
 # Footprint stencil
 # -----------------------------------------------------------------------------
@@ -374,16 +407,15 @@ def footprint_stencil(s: Scenario) -> np.ndarray:
 
 
 # -----------------------------------------------------------------------------
-# Core nozzle-position helper (used by both simulation and motion viz)
+# Core nozzle-position helper (scalar version — kept for simulate_pressure)
 # -----------------------------------------------------------------------------
 def nozzle_positions_hull(s: Scenario, t: float,
                           rotated: list[tuple[float, float, int]],
                           phases: list[float]
                           ) -> list[list[tuple[float, float]]]:
     """
-    Return nozzle positions in the hull frame at time t.
+    Nozzle positions in the hull frame at time t.
     Output: list per disc -> list of (x, y) positions, one per nozzle.
-    The array centroid is at (0, array_y_offset_init + rov_speed*t + row_pitch/2).
     """
     rov_speed_mm_s = s.rov_speed_kn * KNOTS_TO_MPS * 1000.0
     omega = s.rpm * 2 * math.pi / 60.0
@@ -391,7 +423,6 @@ def nozzle_positions_hull(s: Scenario, t: float,
     cos_t, sin_t = math.cos(yaw_rad), math.sin(yaw_rad)
     ir = s.impact_radius_mm()
 
-    # Same array placement as simulate_pressure: at t=0 the leading edge is at -margin.
     rys = [r[1] for r in rotated]
     array_leading_y = min(rys) - s.disc_diameter_mm / 2
     margin_mm = 120
@@ -429,7 +460,61 @@ def disc_centres_hull(s: Scenario, t: float,
 
 
 # -----------------------------------------------------------------------------
-# Pressure simulation (optionally stopping early for cumulative visualisation)
+# Vectorised trail computation
+# -----------------------------------------------------------------------------
+def nozzle_trails_vec(s: Scenario, ts: np.ndarray,
+                      rotated: list[tuple[float, float, int]],
+                      phases: list[float]
+                      ) -> np.ndarray:
+    """
+    Vectorised nozzle positions for all (time, disc, nozzle) tuples.
+
+    Returns array of shape (T, D, N, 2) with (x, y) in hull frame, where
+      T = len(ts), D = #discs, N = n_nozzles.
+    """
+    ts = np.asarray(ts, dtype=np.float64)
+    T = ts.size
+    D = len(rotated)
+    N = s.n_nozzles
+
+    rov_speed_mm_s = s.rov_speed_kn * KNOTS_TO_MPS * 1000.0
+    omega = s.rpm * 2 * math.pi / 60.0
+    yaw_rad = math.radians(s.yaw_deg)
+    cos_yaw, sin_yaw = math.cos(yaw_rad), math.sin(yaw_rad)
+    ir = s.impact_radius_mm()
+
+    rys = np.array([r[1] for r in rotated])
+    array_leading_y = rys.min() - s.disc_diameter_mm / 2
+    margin_mm = 120
+    array_y_offset_init = -margin_mm - array_leading_y
+    array_y_t = array_y_offset_init + rov_speed_mm_s * ts      # (T,)
+
+    disc_rx = np.array([r[0] for r in rotated])                # (D,)
+    disc_ry = np.array([r[1] for r in rotated])                # (D,)
+    disc_dir = np.array([r[2] for r in rotated], dtype=np.float64)  # (D,)
+    phases_arr = np.asarray(phases, dtype=np.float64)          # (D,)
+
+    # nozzle index offsets (N,)
+    nk = np.arange(N, dtype=np.float64) * (2 * math.pi / N)
+
+    # phase[T, D, N] = phases[D] + dir[D] * omega * ts[T] + 2πk/N [N]
+    phase = (phases_arr[None, :, None]
+             + disc_dir[None, :, None] * omega * ts[:, None, None]
+             + nk[None, None, :])
+
+    lx = ir * np.cos(phase)                                     # (T, D, N)
+    ly = ir * np.sin(phase)
+    gx = lx * cos_yaw - ly * sin_yaw
+    gy = lx * sin_yaw + ly * cos_yaw
+
+    x = disc_rx[None, :, None] + gx                              # (T, D, N)
+    y = disc_ry[None, :, None] + array_y_t[:, None, None] + gy   # (T, D, N)
+
+    return np.stack([x, y], axis=-1)   # (T, D, N, 2)
+
+
+# -----------------------------------------------------------------------------
+# Pressure simulation (unchanged — supports optional t_stop_s)
 # -----------------------------------------------------------------------------
 def simulate_pressure(s: Scenario, t_stop_s: float | None = None
                       ) -> tuple[np.ndarray, dict, tuple[int, int, int, int]]:
@@ -547,133 +632,151 @@ def simulate_pressure(s: Scenario, t_stop_s: float | None = None
 
 
 # -----------------------------------------------------------------------------
-# Motion visualisation: disc + nozzle snapshot with cycloid trails
+# Fast motion-viz renderer
 # -----------------------------------------------------------------------------
-def plot_motion(s: Scenario, t_now_s: float,
-                trail_revolutions: float = 1.0,
-                frame: str = "Hull frame",
-                cumulative_strip: np.ndarray | None = None) -> plt.Figure:
+def plot_motion_fast(s: Scenario, t_now_s: float,
+                     trail_revolutions: float = 1.0,
+                     frame: str = "Hull frame",
+                     cumulative_strip: np.ndarray | None = None
+                     ) -> plt.Figure:
     """
-    Render a snapshot of the array at time t_now_s, with nozzle-position
-    trails extending backward `trail_revolutions` disc revolutions in time.
-
-    frame = "Hull frame": hull is stationary, array moves upward (+y).
-    frame = "ROV frame":  array is stationary; hull scrolls downward.
+    Fast render: trails via LineCollection, current footprints via
+    PatchCollection. Trails computed by vectorised NumPy.
     """
     rotated = compute_rotated_discs(s)
     phases = [2 * math.pi * i / max(len(rotated), 1) for i in range(len(rotated))]
+    D = len(rotated)
+    N = s.n_nozzles
 
     omega = s.rpm * 2 * math.pi / 60.0
     trail_duration_s = trail_revolutions * (2 * math.pi / max(omega, 1e-6))
     t_start = max(0.0, t_now_s - trail_duration_s)
     rov_speed_mm_s = s.rov_speed_kn * KNOTS_TO_MPS * 1000.0
 
-    # Sample the trail densely enough to render smoothly
-    trail_n = max(30, int(trail_revolutions * 90))
-    ts = np.linspace(t_start, t_now_s, trail_n) if trail_duration_s > 0 else np.array([t_now_s])
+    # Sample density: keep segment length in physical units roughly constant.
+    # Target ~4° of rotation per sample.
+    trail_n = max(20, int(trail_revolutions * 90))
+    trail_n = min(trail_n, 2000)  # hard cap
+    if trail_duration_s > 0:
+        ts = np.linspace(t_start, t_now_s, trail_n)
+    else:
+        ts = np.array([t_now_s])
 
-    # Compute trails in HULL frame: call nozzle_positions_hull once per
-    # time sample and unpack into [disc][nozzle] lists of (x, y).
-    trails_by_disc = [[[] for _ in range(s.n_nozzles)] for _ in rotated]
-    for t in ts:
-        per_disc = nozzle_positions_hull(s, float(t), rotated, phases)
-        for di in range(len(rotated)):
-            for kn in range(s.n_nozzles):
-                trails_by_disc[di][kn].append(per_disc[di][kn])
+    pts = nozzle_trails_vec(s, ts, rotated, phases)   # (T, D, N, 2)
 
-    # Current disc centres
-    centres_now = disc_centres_hull(s, t_now_s, rotated)
-    nozzles_now = nozzle_positions_hull(s, t_now_s, rotated, phases)
-
-    # Determine plot extents. In ROV frame we subtract array_y from every y coord.
+    # Apply ROV-frame shift if needed
     if frame == "ROV frame":
-        # Compute array_y at t_now_s
-        rys_rot = [r[1] for r in rotated]
-        array_leading_y = min(rys_rot) - s.disc_diameter_mm / 2
+        rys_rot = np.array([r[1] for r in rotated])
+        array_leading_y = rys_rot.min() - s.disc_diameter_mm / 2
         margin_mm = 120
         array_y_offset_init = -margin_mm - array_leading_y
+        array_y_t = array_y_offset_init + rov_speed_mm_s * ts
+        # Subtract each row's array_y from each time slice
+        pts = pts.copy()
+        pts[..., 1] -= array_y_t[:, None, None]
         array_y_now = array_y_offset_init + rov_speed_mm_s * t_now_s
-        y_shift = -array_y_now
+        y_shift_now = -array_y_now
     else:
-        y_shift = 0.0
+        array_y_now = 0.0  # ignored
+        y_shift_now = 0.0
 
-    def shift_pt(xy):
-        return xy[0], xy[1] + y_shift
-
+    # Build line segments for LineCollection.
+    # For each (disc, nozzle) series of T points -> (T-1) line segments.
+    # Concatenate all DNx (T-1) segments into one array of shape (S, 2, 2).
+    T = pts.shape[0]
     fig, ax = plt.subplots(figsize=(9, 5.5))
 
-    # Cumulative heatmap underlay (hull frame only — not sensible in ROV frame)
+    # Cumulative heatmap underlay (hull frame only)
     if cumulative_strip is not None and frame == "Hull frame":
-        # The strip starts at y=0 (in hull coords) and spans strip.shape[0]*10 mm
-        array_span_x = (max(r[0] for r in rotated) - min(r[0] for r in rotated)
-                        + s.disc_diameter_mm)
+        rxs_rot = [r[0] for r in rotated]
+        array_span_x = max(rxs_rot) - min(rxs_rot) + s.disc_diameter_mm
         extent = [-array_span_x / 2, array_span_x / 2,
                   cumulative_strip.shape[0] * CELL_SIZE_MM, 0]
         vmax = max(float(cumulative_strip.max()), 1e-6)
         ax.imshow(cumulative_strip, extent=extent, aspect="auto",
                   cmap="viridis", vmin=0, vmax=vmax, alpha=0.7, zorder=0)
 
-    # Draw disc outlines at current time
+    # Trails via LineCollection with per-segment alpha
+    if T >= 2:
+        # Pts for each nozzle: shape (T, 2). We need consecutive pairs.
+        # Reshape pts -> (D*N, T, 2)
+        pts_flat = pts.transpose(1, 2, 0, 3).reshape(D * N, T, 2)
+        # Segments: (D*N, T-1, 2, 2)
+        segs = np.stack([pts_flat[:, :-1, :], pts_flat[:, 1:, :]], axis=2)
+        segs = segs.reshape(-1, 2, 2)                         # (D*N*(T-1), 2, 2)
+        # Alpha gradient — newer samples more opaque
+        frac = np.linspace(0.0, 1.0, T - 1)                    # (T-1,)
+        alphas = 0.15 + 0.55 * frac                            # (T-1,)
+        alphas_all = np.tile(alphas, D * N)                    # (D*N*(T-1),)
+        # Build RGBA colours (all orange, varying alpha)
+        base_rgb = np.array([1.0, 127/255, 14/255])
+        colors = np.empty((alphas_all.size, 4))
+        colors[:, :3] = base_rgb[None, :]
+        colors[:, 3] = alphas_all
+        lc = LineCollection(segs, colors=colors, linewidths=0.9, zorder=2)
+        ax.add_collection(lc)
+
+    # Current nozzle positions (last time slice of pts, but we didn't include
+    # t_now in pts if trail_duration=0; recompute cleanly)
+    pts_now = nozzle_trails_vec(s, np.array([t_now_s]),
+                                rotated, phases)[0]            # (D, N, 2)
+    # Apply ROV-frame shift at t_now
+    if frame == "ROV frame":
+        pts_now = pts_now.copy()
+        pts_now[..., 1] += y_shift_now
+
+    fp_r = s.footprint_dia() / 2.0
     impact_r = s.impact_radius_mm()
-    fp_d = s.footprint_dia()
+
+    # Disc outlines + impact rings via PatchCollections (2 calls total)
+    centres_now = disc_centres_hull(s, t_now_s, rotated)
+    disc_patches = []
+    ring_patches = []
     disc_xs, disc_ys = [], []
     for (cx_d, cy_d, _) in centres_now:
-        cx_s, cy_s = shift_pt((cx_d, cy_d))
-        disc_xs.append(cx_s); disc_ys.append(cy_s)
-        ax.add_patch(mpatches.Circle((cx_s, cy_s), s.disc_diameter_mm / 2,
-                                     fill=False, edgecolor="#1f77b4",
-                                     linewidth=1.2, zorder=3))
-        ax.add_patch(mpatches.Circle((cx_s, cy_s), impact_r,
-                                     fill=False, linestyle="--",
-                                     edgecolor="#888", linewidth=0.6, zorder=3))
+        cy_s = cy_d + y_shift_now
+        disc_xs.append(cx_d); disc_ys.append(cy_s)
+        disc_patches.append(mpatches.Circle(
+            (cx_d, cy_s), s.disc_diameter_mm / 2))
+        ring_patches.append(mpatches.Circle(
+            (cx_d, cy_s), impact_r))
+    ax.add_collection(PatchCollection(
+        disc_patches, facecolor="none", edgecolor="#1f77b4",
+        linewidths=1.2, zorder=3))
+    ax.add_collection(PatchCollection(
+        ring_patches, facecolor="none", edgecolor="#888",
+        linewidths=0.6, linestyles="--", zorder=3))
 
-    # Draw trails + current nozzle footprints
-    for di in range(len(rotated)):
-        for kn in range(s.n_nozzles):
-            trail = trails_by_disc[di][kn]
-            if len(trail) >= 2:
-                tx = [p[0] for p in trail]
-                ty = [p[1] + y_shift for p in trail]
-                # Fade by using alpha gradient (draw segments)
-                for i in range(len(tx) - 1):
-                    frac = i / max(len(tx) - 1, 1)
-                    alpha = 0.15 + 0.55 * frac  # newer = more opaque
-                    ax.plot(tx[i:i + 2], ty[i:i + 2],
-                            color="#ff7f0e", alpha=alpha, lw=0.9, zorder=2)
-            nx_now, ny_now = shift_pt(nozzles_now[di][kn])
-            # Current footprint
-            ax.add_patch(mpatches.Circle(
-                (nx_now, ny_now), fp_d / 2,
-                facecolor="#ff7f0e", alpha=0.55, edgecolor="#c65500",
-                linewidth=0.6, zorder=4))
-            # Nozzle point
-            ax.plot(nx_now, ny_now, "o", color="#c65500", markersize=3, zorder=5)
+    # Current footprints as a single PatchCollection
+    foot_patches = [mpatches.Circle((pts_now[di, kn, 0], pts_now[di, kn, 1]),
+                                     fp_r)
+                    for di in range(D) for kn in range(N)]
+    ax.add_collection(PatchCollection(
+        foot_patches, facecolor="#ff7f0e", alpha=0.55,
+        edgecolor="#c65500", linewidths=0.6, zorder=4))
+    # Current nozzle points (scatter)
+    ax.scatter(pts_now[..., 0].ravel(), pts_now[..., 1].ravel(),
+               c="#c65500", s=10, zorder=5)
 
     # Array frame rectangle (rotated)
-    yaw_rad = math.radians(s.yaw_deg)
-    cos_t, sin_t = math.cos(yaw_rad), math.sin(yaw_rad)
     rys_rot = [r[1] for r in rotated]
     rxs_rot = [r[0] for r in rotated]
     half_fw = max(abs(min(rxs_rot)), abs(max(rxs_rot))) + s.disc_diameter_mm / 2 + 30
     y_top_rel = min(rys_rot) - s.disc_diameter_mm / 2 - 30
     y_bot_rel = max(rys_rot) + s.disc_diameter_mm / 2 + 30
-    # Shift by current array_y
     if frame == "ROV frame":
-        y_top = y_top_rel + 0  # ROV frame: array sits at its rotated local y directly
-        y_bot = y_bot_rel
-        centroid_y = s.row_pitch_mm / 2
+        y_top, y_bot = y_top_rel, y_bot_rel
     else:
-        rov_speed_mm_s_ = rov_speed_mm_s
         array_leading_y = min(rys_rot) - s.disc_diameter_mm / 2
         margin_mm = 120
         array_y_offset_init = -margin_mm - array_leading_y
-        array_y_now = array_y_offset_init + rov_speed_mm_s_ * t_now_s
-        y_top = y_top_rel + array_y_now
-        y_bot = y_bot_rel + array_y_now
-    frame_corners = [(-half_fw, y_top), (half_fw, y_top),
-                     (half_fw, y_bot), (-half_fw, y_bot)]
-    ax.add_patch(mpatches.Polygon(frame_corners, closed=True, fill=False,
-                                  edgecolor="#444", linewidth=1.2, zorder=2))
+        array_y_now_h = array_y_offset_init + rov_speed_mm_s * t_now_s
+        y_top = y_top_rel + array_y_now_h
+        y_bot = y_bot_rel + array_y_now_h
+    ax.add_patch(mpatches.Polygon(
+        [(-half_fw, y_top), (half_fw, y_top),
+         (half_fw, y_bot), (-half_fw, y_bot)],
+        closed=True, fill=False, edgecolor="#444", linewidth=1.2, zorder=2))
 
     # Travel arrow
     if frame == "Hull frame":
@@ -687,11 +790,9 @@ def plot_motion(s: Scenario, t_now_s: float,
                     arrowprops=dict(arrowstyle="->", color="#555"),
                     ha="center", va="center", fontsize=9, color="#555")
 
-    # Axis limits: always include all current disc centres + trails + frame
-    all_x = disc_xs + [p[0] for tr in trails_by_disc for nz in tr for p in nz]
-    all_y = disc_ys + [p[1] + y_shift for tr in trails_by_disc for nz in tr for p in nz]
-    if not all_x:
-        all_x = [-half_fw, half_fw]; all_y = [y_top, y_bot]
+    # Axis limits
+    all_x = list(disc_xs) + [float(pts[..., 0].min()), float(pts[..., 0].max())]
+    all_y = list(disc_ys) + [float(pts[..., 1].min()), float(pts[..., 1].max())]
     x_lo = min(min(all_x), -half_fw) - 60
     x_hi = max(max(all_x), half_fw) + 180
     y_lo = min(min(all_y), y_top) - 60
@@ -712,7 +813,7 @@ def plot_motion(s: Scenario, t_now_s: float,
 
 
 # -----------------------------------------------------------------------------
-# Result renderer (KPI cards + heatmaps)
+# Result renderer (KPI cards + heatmaps) — unchanged
 # -----------------------------------------------------------------------------
 def render_result(s: Scenario, strip: np.ndarray, m: dict,
                   core_box: tuple[int, int, int, int],
@@ -794,66 +895,149 @@ if not compare_mode:
     left, right = st.columns([1.2, 1.0])
     with left:
         st.subheader("Top-down view")
-        st.pyplot(plot_topdown(scen), clear_figure=True)
+        st.pyplot(plot_topdown(scen), clear_figure=False)
     with right:
         st.subheader("Side view (one disc)")
-        st.pyplot(plot_side(scen), clear_figure=True)
+        st.pyplot(plot_side(scen), clear_figure=False)
 
     st.divider()
 
-    # Motion visualisation
+    # ------------------------------------------------------------------
+    # Motion visualisation (fast)
+    # ------------------------------------------------------------------
     with st.expander("Motion visualisation (time snapshot + nozzle trails)",
                      expanded=False):
-        # Total traversal time = sim_length / rov_speed (same as simulate_pressure)
         rov_speed_mm_s = scen.rov_speed_kn * KNOTS_TO_MPS * 1000.0
         total_time_s = scen.sim_length_mm / max(rov_speed_mm_s, 1e-6)
+        total_ms = int(total_time_s * 1000)
 
-        mc1, mc2, mc3 = st.columns([1.5, 1.0, 1.0])
+        # Use session_state so Play button and slider share t
+        if "t_ms" not in st.session_state:
+            st.session_state.t_ms = total_ms // 4
+
+        mc1, mc2, mc3 = st.columns([1.6, 1.0, 1.0])
         with mc1:
             t_ms = st.slider(
                 "Snapshot time (ms)",
                 min_value=0,
-                max_value=int(total_time_s * 1000),
-                value=int(total_time_s * 1000 * 0.25),
-                step=max(1, int(total_time_s * 1000 / 400)),
+                max_value=total_ms,
+                value=int(st.session_state.t_ms),
+                step=max(1, total_ms // 400),
+                key="t_ms_slider",
                 help="Scrub through the traversal to see the state at any instant.")
+            st.session_state.t_ms = t_ms
         with mc2:
             trail_rev = st.slider(
                 "Trail length (disc revolutions)",
-                0.0, 5.0, 1.0, step=0.25,
+                0.0, 20.0, 2.0, step=0.25,
+                key="trail_rev_slider",
                 help="How far back in time to draw each nozzle's path.")
         with mc3:
             frame = st.radio(
                 "Reference frame",
                 ["Hull frame", "ROV frame"],
                 index=0,
+                key="frame_radio",
                 help="Hull frame: array translates, hull is stationary. "
                      "ROV frame: array is stationary; trails look like rosettes.")
 
-        show_underlay = st.checkbox(
-            "Show cumulative cleaning underlay (hull frame only)",
-            value=False,
-            help="Re-runs the pressure simulation up to the snapshot time and "
-                 "shows the bar·s exposure so far as a faint heatmap. "
-                 "Adds ~1–3 s per frame change.")
+        # Play controls
+        pc1, pc2, pc3, pc4 = st.columns([1, 1, 1.3, 1.3])
+        play = pc1.button("▶ Play", key="play_btn",
+                          help="Animate the traversal as a flip-book.")
+        play_speed = pc2.select_slider(
+            "Speed", options=["0.25x", "0.5x", "1x", "2x", "4x"],
+            value="1x", key="play_speed")
+        play_frames = pc3.slider(
+            "Animation frames", 20, 200, 80, step=10, key="play_frames",
+            help="More frames = smoother but slower.")
+        show_underlay_live = pc4.checkbox(
+            "Underlay during play",
+            value=False, key="underlay_live",
+            help="Show cumulative cleaning during animation. "
+                 "Slow — only enable for short traversals.")
+
+        # Underlay is opt-in via button (so scrubbing stays fast)
+        bc1, bc2 = st.columns([1, 2])
+        compute_underlay = bc1.button(
+            "Compute underlay",
+            key="compute_underlay_btn",
+            help="Run the pressure sim up to the current time and cache it. "
+                 "Doesn't re-run when the slider moves (use this button again "
+                 "for a new time).")
+        if bc2.checkbox(
+            "Show cached underlay (hull frame only)",
+            value=False, key="show_underlay_cb",
+            help="Toggle the cached heatmap on/off without re-running."):
+            show_underlay = True
+        else:
+            show_underlay = False
+
+        if compute_underlay:
+            with st.spinner(f"Running cumulative simulation to t = {t_ms} ms…"):
+                cum, _m, _c = simulate_pressure(scen, t_stop_s=t_ms / 1000.0)
+                st.session_state["underlay"] = {
+                    "data": cum,
+                    "t_ms": t_ms,
+                    "scen_key": scenario_full_key(scen),
+                }
 
         cumulative = None
-        if show_underlay and frame == "Hull frame":
-            with st.spinner("Running cumulative simulation…"):
-                cumulative, _m, _c = simulate_pressure(scen, t_stop_s=t_ms / 1000.0)
+        cached = st.session_state.get("underlay")
+        # Invalidate cache if scenario geometry/operating point changed
+        if cached and cached.get("scen_key") != scenario_full_key(scen):
+            cached = None
+            st.session_state.pop("underlay", None)
+        if show_underlay and frame == "Hull frame" and cached is not None:
+            cumulative = cached["data"]
+            st.caption(
+                f"Showing cached underlay computed at t = {cached['t_ms']} ms "
+                f"(re-click *Compute underlay* after moving the slider)."
+            )
 
-        st.pyplot(
-            plot_motion(scen, t_ms / 1000.0,
-                        trail_revolutions=trail_rev,
-                        frame=frame,
-                        cumulative_strip=cumulative),
+        # Plot current snapshot
+        snapshot_slot = st.empty()
+        snapshot_slot.pyplot(
+            plot_motion_fast(scen, t_ms / 1000.0,
+                             trail_revolutions=trail_rev,
+                             frame=frame,
+                             cumulative_strip=cumulative),
             clear_figure=True)
+
+        # Animation (Play)
+        if play:
+            speed_map = {"0.25x": 0.25, "0.5x": 0.5, "1x": 1.0,
+                         "2x": 2.0, "4x": 4.0}
+            speed = speed_map[play_speed]
+            # Each frame represents total_time_s / play_frames of real time.
+            # Wall-clock frame period (target) = that real time / speed.
+            frame_wall_dt = (total_time_s / play_frames) / speed
+            # Clamp to 15..200 ms for a sane flip-book
+            frame_wall_dt = max(0.015, min(frame_wall_dt, 0.2))
+
+            times_ms = np.linspace(0, total_ms, play_frames).astype(int)
+            for i, tm in enumerate(times_ms):
+                t_sec = tm / 1000.0
+                cum_play = None
+                if show_underlay_live and frame == "Hull frame":
+                    cum_play, _m, _c = simulate_pressure(scen, t_stop_s=t_sec)
+                fig_anim = plot_motion_fast(
+                    scen, t_sec,
+                    trail_revolutions=trail_rev,
+                    frame=frame,
+                    cumulative_strip=cum_play)
+                snapshot_slot.pyplot(fig_anim, clear_figure=True)
+                plt.close(fig_anim)
+                time.sleep(frame_wall_dt)
+            # Leave slider at the final frame
+            st.session_state.t_ms = int(times_ms[-1])
 
         st.caption(
             f"Total traversal time: {total_time_s*1000:.0f} ms "
             f"({total_time_s:.2f} s). "
             f"Disc period at {scen.rpm} RPM: "
-            f"{60000/max(scen.rpm,1):.1f} ms/rev."
+            f"{60000/max(scen.rpm,1):.1f} ms/rev. "
+            f"At 20 rev, trail covers {20*60000/max(scen.rpm,1):.0f} ms."
         )
 
     st.divider()
@@ -878,10 +1062,10 @@ else:
     top_a, top_b = st.columns(2)
     with top_a:
         st.subheader("Scenario A — layout")
-        st.pyplot(plot_topdown(scen_a, "Scenario A"), clear_figure=True)
+        st.pyplot(plot_topdown(scen_a, "Scenario A"), clear_figure=False)
     with top_b:
         st.subheader("Scenario B — layout")
-        st.pyplot(plot_topdown(scen_b, "Scenario B"), clear_figure=True)
+        st.pyplot(plot_topdown(scen_b, "Scenario B"), clear_figure=False)
 
     st.divider()
     if st.button("Run both simulations", type="primary"):
@@ -934,12 +1118,19 @@ exposure* in **bar·seconds**.
 Nozzle trails are the past `N` revolutions of each nozzle's trajectory
 in the hull frame (so they look like curtate/prolate cycloids) or the
 ROV frame (where they look like pure rosettes because the array
-translation is factored out).
+translation is factored out). Trails are drawn with a single
+`LineCollection` for fast rendering, and current footprints with a
+`PatchCollection`, so scrubbing the slider stays responsive even at
+20 rev trail length.
 
-**Cumulative underlay.** Re-runs the pressure simulation from 0 up to the
-chosen snapshot time and draws the bar·s exposure so far as a faint
-heatmap. Useful for seeing *which parts* of the hull have received
-cleaning by time t.
+**Play button.** Steps through the traversal as a flip-book (20–200
+frames). The `Underlay during play` checkbox re-runs the pressure sim
+at every frame and is therefore much slower — leave it off for smooth
+playback.
+
+**Cumulative underlay.** Opt-in: click *Compute underlay* to run the
+pressure sim up to the current time; tick *Show cached underlay* to
+display it. The cache is invalidated when scenario parameters change.
 
 **Footprint diameter on hull.** Linear with pressure (60 mm at 50 bar →
 80 mm at 600 bar) or manual override.
