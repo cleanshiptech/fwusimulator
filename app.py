@@ -565,17 +565,34 @@ def plot_footprint_sensitivity(s: Scenario) -> plt.Figure:
 # Footprint stencil
 # -----------------------------------------------------------------------------
 def footprint_stencil(s: Scenario) -> np.ndarray:
+    """
+    Weight per cell for one nozzle deposit. The UNIFORM profile deposits a
+    weight of 1.0 into every cell inside the footprint, so a pass deposits
+    P·dt into each covered cell — total energy ≈ P·dt·footprint_area.
+
+    The GAUSSIAN profile models the same jet with a peaked (centre-heavy)
+    intensity rather than a flat one. It is normalised to deposit the SAME
+    total energy as the uniform disc (it redistributes energy toward the
+    centre, raising the peak, rather than discarding it). Without this
+    normalisation a Gaussian footprint silently deposits only ~half the
+    uniform energy, collapsing the bar·s KPIs.
+    """
     r_mm = s.footprint_dia() / 2.0
     r_cells = r_mm / s.cell_size_mm
     half = int(math.ceil(r_cells)) + 1
     yy, xx = np.ogrid[-half:half + 1, -half:half + 1]
     r2 = (xx ** 2 + yy ** 2).astype(np.float32)
+    uniform = (r2 <= r_cells ** 2).astype(np.float32)
     if s.pressure_profile.startswith("Uniform"):
-        stencil = (r2 <= r_cells ** 2).astype(np.float32)
-    else:
-        sigma = r_cells / 2.0
-        stencil = np.exp(-r2 / (2 * sigma ** 2)).astype(np.float32)
-        stencil[r2 > (r_cells * 1.5) ** 2] = 0.0
+        return uniform
+    sigma = r_cells / 2.0
+    stencil = np.exp(-r2 / (2 * sigma ** 2)).astype(np.float32)
+    stencil[r2 > (r_cells * 1.5) ** 2] = 0.0
+    # Normalise so the Gaussian deposits the same TOTAL energy as the
+    # uniform disc of this footprint (same P·dt·area; centre-weighted).
+    total = float(stencil.sum())
+    if total > 0.0:
+        stencil *= float(uniform.sum()) / total
     return stencil
 
 
