@@ -836,6 +836,31 @@ def footprint_stencil(s: Scenario) -> np.ndarray:
     return stencil
 
 
+def footprint_profile_peaknorm(s: Scenario) -> np.ndarray:
+    """
+    Footprint intensity profile normalised so its PEAK = 1.0. Used to map the
+    jet stagnation pressure ACROSS the footprint: a cell at the footprint
+    centre receives the full delivered pressure (profile = 1) and the edges a
+    fraction. This is the spatial basis for the delivered-pressure heatmap and
+    the per-cell intensity gate (distinct from the energy-conserving stencil
+    above, which is for the bar·s dose).
+    """
+    r_mm = s.footprint_dia() / 2.0
+    r_cells = r_mm / s.cell_size_mm
+    half = int(math.ceil(r_cells)) + 1
+    yy, xx = np.ogrid[-half:half + 1, -half:half + 1]
+    r2 = (xx ** 2 + yy ** 2).astype(np.float32)
+    if s.pressure_profile.startswith("Uniform"):
+        return (r2 <= r_cells ** 2).astype(np.float32)
+    sigma = r_cells / 2.0
+    prof = np.exp(-r2 / (2 * sigma ** 2)).astype(np.float32)
+    prof[r2 > (r_cells * 1.5) ** 2] = 0.0
+    pk = float(prof.max())
+    if pk > 0.0:
+        prof /= pk        # peak = 1.0
+    return prof
+
+
 # -----------------------------------------------------------------------------
 # Core nozzle-position helper (scalar version — kept for simulate_pressure)
 # -----------------------------------------------------------------------------
@@ -974,6 +999,7 @@ def simulate_pressure(s: Scenario, t_stop_s: float | None = None
     ny = int(full_extent / cell)
     grid = np.zeros((ny, nx), dtype=np.float32)
     passes = np.zeros((ny, nx), dtype=np.float32)  # nozzle passes per cell
+    peak_pressure = np.zeros((ny, nx), dtype=np.float32)  # max delivered bar/cell
 
     # Time-step constraints. The integrated exposure is Σ p·dt, which only
     # tracks the true dwell time if the jet's footprint cannot SKIP past
@@ -1067,28 +1093,44 @@ def simulate_pressure(s: Scenario, t_stop_s: float | None = None
         # criterion, distinct from the energy (bar·s) deposit above.
         binary_stencil = (stencil > 0.0).astype(np.float32)
 
+        # Shared FFT of the hit grid, reused by every deposit below.
+        fy = pny + sh - 1
+        fx = pnx + sw - 1
+        H = np.fft.rfft2(hit, s=(fy, fx))
+
+        def conv_with(kernel: np.ndarray) -> np.ndarray:
+            K = np.fft.rfft2(kernel, s=(fy, fx))
+            c = np.fft.irfft2(H * K, s=(fy, fx))
+            return c[2 * rr:2 * rr + ny, 2 * rr:2 * rr + nx].astype(np.float32)
+
         if sh == 1 and sw == 1:
             # Single-cell footprint (sub-resolution jet): no spread to apply.
             hcore = hit[rr:rr + ny, rr:rr + nx]
             grid += hcore * weighted_stencil[0, 0]
             passes += hcore * binary_stencil[0, 0]
+            peak_pressure += (hcore > 0.5) * s.stagnation_pressure_bar()
         else:
-            # FFT convolution: O(MN log MN), stencil-size independent. The
-            # hit grid's FFT is shared by the energy and pass-count deposits.
-            fy = pny + sh - 1
-            fx = pnx + sw - 1
-            H = np.fft.rfft2(hit, s=(fy, fx))
-            K = np.fft.rfft2(weighted_stencil, s=(fy, fx))
-            conv = np.fft.irfft2(H * K, s=(fy, fx))
-            # The hit at padded (piy, pix) deposits stencil cell (dy, dx) at
-            # padded (piy+dy-rr, pix+dx-rr); the full convolution places it at
-            # conv[piy+dy, pix+dx]. The real grid cell (i, j) corresponds to
-            # padded (i+rr, j+rr), so it reads conv[i+2*rr, j+2*rr].
-            grid += conv[2 * rr:2 * rr + ny, 2 * rr:2 * rr + nx].astype(np.float32)
-            Kb = np.fft.rfft2(binary_stencil, s=(fy, fx))
-            convb = np.fft.irfft2(H * Kb, s=(fy, fx))
-            passes += convb[2 * rr:2 * rr + ny,
-                            2 * rr:2 * rr + nx].astype(np.float32)
+            # Energy (bar·s) and pass-count deposits via FFT convolution.
+            grid += conv_with(weighted_stencil)
+            passes += conv_with(binary_stencil)
+
+            # Peak delivered pressure per cell, built as a few nested bands.
+            # The peak pressure at a cell is P_stag · profile(d), d = distance
+            # to the nearest hit centre. Thresholding the peak-normalised
+            # profile at a few levels and presence-convolving each band marks
+            # cells within that band's radius of any hit; the max band reached
+            # is the delivered pressure. O(few · MN log MN), footprint-size
+            # independent — far cheaper than a per-cell max-dilation.
+            peak_prof = footprint_profile_peaknorm(s)
+            p_stag = s.stagnation_pressure_bar()
+            bands = np.zeros((ny, nx), dtype=np.float32)
+            for lv in (0.1, 0.25, 0.4, 0.55, 0.7, 0.85, 1.0):
+                sub = (peak_prof >= lv).astype(np.float32)
+                if sub.sum() == 0:
+                    continue
+                covered = conv_with(sub) > 0.5
+                np.maximum(bands, covered * (lv * p_stag), out=bands)
+            peak_pressure += bands
 
     y_strip_start = 0
     y_strip_end = int((s.sim_length_mm + array_span_y) / cell)
@@ -1096,6 +1138,8 @@ def simulate_pressure(s: Scenario, t_stop_s: float | None = None
     x_strip_end = int((margin_mm + array_span_x) / cell)
     strip = grid[y_strip_start:y_strip_end, x_strip_start:x_strip_end]
     passes_strip = passes[y_strip_start:y_strip_end, x_strip_start:x_strip_end]
+    pressure_strip = peak_pressure[y_strip_start:y_strip_end,
+                                   x_strip_start:x_strip_end]
 
     core_y0 = int(array_span_y / cell)
     core_y1 = int(s.sim_length_mm / cell)
@@ -1108,19 +1152,22 @@ def simulate_pressure(s: Scenario, t_stop_s: float | None = None
     if s.steady_state_only:
         region = strip[core_y0:core_y1, core_x0:core_x1]
         region_passes = passes_strip[core_y0:core_y1, core_x0:core_x1]
+        region_pressure = pressure_strip[core_y0:core_y1, core_x0:core_x1]
     else:
         region = strip
         region_passes = passes_strip
+        region_pressure = pressure_strip
 
-    # --- Cleaning criterion: intensity gate × dose gate -------------------
-    # Intensity: the jet must deliver enough stagnation pressure at the hull
-    # to lift the fouling. This is per-scenario (same jet everywhere), so it
-    # gates the WHOLE field on or off. Dose: a cell also needs a minimum
-    # number of passes. A cell is cleaned iff both hold.
-    p_stag = s.stagnation_pressure_bar()
-    intensity_ok = p_stag >= s.removal_pressure_bar
-    if region_passes.size and intensity_ok:
-        cleaned_mask = region_passes >= s.min_passes
+    # --- Cleaning criterion: PER-CELL intensity gate × dose gate ----------
+    # Each cell has its own delivered pressure (the jet is more intense at
+    # the footprint centre than its edges), so the intensity gate is applied
+    # per cell, not globally. A cell is cleaned iff the pressure delivered
+    # there clears the removal threshold AND it received >= min passes.
+    p_stag = s.stagnation_pressure_bar()         # centreline (peak) delivered
+    intensity_ok = p_stag >= s.removal_pressure_bar   # can ANY cell clean?
+    if region_passes.size:
+        cleaned_mask = ((region_pressure >= s.removal_pressure_bar)
+                        & (region_passes >= s.min_passes))
         cleaned_pct = float(cleaned_mask.mean() * 100.0)
     else:
         cleaned_pct = 0.0
@@ -1146,12 +1193,17 @@ def simulate_pressure(s: Scenario, t_stop_s: float | None = None
         "intensity_ok": bool(intensity_ok),
         "median_passes": float(np.median(region_passes)) if region_passes.size else 0.0,
         "max_passes": float(region_passes.max()) if region_passes.size else 0.0,
+        "median_pressure_bar": float(np.median(region_pressure[region_pressure > 0]))
+                              if (region_pressure > 0).any() else 0.0,
         "missed_pct": float((region == 0).mean() * 100.0) if region.size else 0.0,
         "region_area_mm2": float(region.size * cell * cell),
         "total_time_s": total_time_full,
         "arc_per_step_mm": float(arc_per_step),
         "footprint_mm": float(fp_d),
         "undersampled": bool(undersampled),
+        # Spatial maps for the heatmaps (delivered pressure is the new primary).
+        "pressure_strip": pressure_strip,
+        "passes_strip": passes_strip,
     }
     return strip, metrics, core_box
 
@@ -1718,6 +1770,43 @@ def render_result(s: Scenario, strip: np.ndarray, m: dict,
 
     array_span_x = m["array_span_x_mm"]
     cell = s.cell_size_mm
+
+    # ---- PRIMARY heatmap: jet pressure delivered at the hull (bar) --------
+    # Each cell coloured by the peak stagnation pressure delivered there. The
+    # removal threshold is drawn as a contour, so you can see directly which
+    # parts of the hull were exposed to >= the cleaning pressure — the
+    # spatial, per-cell version of the intensity gate.
+    pmap_full = m.get("pressure_strip")
+    if pmap_full is not None:
+        if s.steady_state_only:
+            pmap = pmap_full[cy0:cy1, cx0:cx1]
+            pmap_y = (cy1 - cy0) * cell
+        else:
+            pmap = pmap_full
+            pmap_y = pmap_full.shape[0] * cell
+        ext = [-array_span_x / 2, array_span_x / 2, pmap_y, 0]
+        figp, axp = plt.subplots(figsize=(8, 3.6))
+        pvmax = max(float(pmap.max()), s.removal_pressure_bar * 1.5, 1e-6)
+        imp = axp.imshow(pmap, extent=ext, aspect="auto", cmap="inferno",
+                         vmin=0, vmax=pvmax)
+        # Threshold contour: boundary between cleaned-pressure and below.
+        if pmap.max() >= s.removal_pressure_bar > pmap.min():
+            axp.contour(
+                pmap, levels=[s.removal_pressure_bar],
+                extent=[ext[0], ext[1], ext[3], ext[2]],
+                colors="#39ff14", linewidths=1.2)
+        axp.set_xlabel("Across-track (mm)")
+        axp.set_ylabel("Along-track (mm)")
+        axp.set_title(
+            f"{label}Delivered pressure at hull (bar) — green contour = "
+            f"{s.removal_pressure_bar:.0f} bar removal threshold")
+        plt.colorbar(imp, ax=axp, label="bar delivered")
+        container.pyplot(figp, clear_figure=True)
+        container.caption(
+            "Inside the green contour the jet delivers enough pressure to "
+            "lift the fouling; outside it, no amount of dwell cleans. The "
+            f"**Cleaned area ({m.get('cleaned_pct', 0):.1f}%)** is the part of "
+            f"this region that is *also* struck ≥ {s.min_passes} times.")
 
     # ---- Exposure dose (bar·s) — diagnostic only, demoted into an expander.
     # The cleaning verdict is the gated Cleaned-area KPI above; bar·s is a
