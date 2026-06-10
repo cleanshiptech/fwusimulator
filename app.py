@@ -58,6 +58,9 @@ st.caption(
 )
 
 KNOTS_TO_MPS = 0.514444
+# Hull-grid resolution is now per-scenario (Scenario.cell_size_mm). This
+# constant is kept only as a legacy default; the sim/render paths read the
+# scenario value so the grid can be refined to 1–2 mm for small footprints.
 CELL_SIZE_MM = 10.0
 
 
@@ -90,13 +93,15 @@ class Scenario:
     nozzle_exit_mm: float = 1.5
 
     # Jet footprint model
-    footprint_mode: str = "Linear with pressure (60->80 mm)"
+    footprint_mode: str = "Physical jet (exit dia + standoff)"
     footprint_dia_mm_override: int = 70
+    jet_spread_deg: float = 8.0     # free-jet half-cone spread angle
     pressure_profile: str = "Gaussian (peak at centre)"
 
     # Hull strip & threshold
-    sim_length_mm: int = 5000
+    sim_length_mm: int = 2000
     clean_threshold: float = 5.0    # bar·s — calibrate against field trials
+    cell_size_mm: float = 5.0       # hull-grid resolution
 
     # Post-processing
     steady_state_only: bool = True
@@ -104,7 +109,15 @@ class Scenario:
     def footprint_dia(self) -> float:
         if self.footprint_mode == "Manual override":
             return float(self.footprint_dia_mm_override)
-        return 60.0 + (self.pressure_bar - 50.0) / (600.0 - 50.0) * 20.0
+        if self.footprint_mode.startswith("Linear with pressure"):
+            return 60.0 + (self.pressure_bar - 50.0) / (600.0 - 50.0) * 20.0
+        # Physical jet: a free jet of exit diameter d0 spreads as a cone of
+        # half-angle θ over the standoff L, so its impingement footprint is
+        #   d_fp = d0 + 2·L·tan(θ).
+        # Both the nozzle exit diameter and the distance to the hull drive it.
+        return (self.nozzle_exit_mm
+                + 2.0 * self.standoff_mm
+                * math.tan(math.radians(self.jet_spread_deg)))
 
     def impact_radius_mm(self) -> float:
         return max(
@@ -120,7 +133,8 @@ def scenario_key(s: Scenario) -> tuple:
             s.row_pitch_mm, s.yaw_deg, s.disc_diameter_mm, s.n_nozzles,
             s.nozzle_radius_mm, s.nozzle_cant_deg, s.standoff_mm,
             s.counter_rotate, s.pressure_bar, s.footprint_mode,
-            s.footprint_dia_mm_override)
+            s.footprint_dia_mm_override, s.nozzle_exit_mm, s.jet_spread_deg,
+            s.cell_size_mm)
 
 
 def scenario_full_key(s: Scenario) -> tuple:
@@ -193,16 +207,62 @@ def scenario_controls(prefix: str, defaults: Scenario, container) -> Scenario:
         key=k("nozzle_exit_mm"))
 
     container.subheader("Jet footprint model")
+    _grid_opts = [10.0, 5.0, 2.0, 1.0]
+    _grid_idx = (_grid_opts.index(s.cell_size_mm)
+                 if s.cell_size_mm in _grid_opts else 1)
+    s.cell_size_mm = container.selectbox(
+        "Hull grid resolution (mm/cell)", _grid_opts, index=_grid_idx,
+        format_func=lambda v: f"{v:g} mm"
+        + {10.0: "  (fast)", 1.0: "  (true footprint, slower)"}.get(v, ""),
+        key=k("cell_size_mm"),
+        help="Cell size of the hull grid. Finer grids resolve small "
+             "(sub-cm) physical footprints but cost ~1/cell² in memory "
+             "and up to ~1/cell⁴ in compute. The deposit loop is "
+             "vectorised, so 1–2 mm stays responsive for the small "
+             "physical-jet footprint; the legacy large footprint is "
+             "heavier at 1 mm.")
+    _fp_modes = [
+        "Physical jet (exit dia + standoff)",
+        "Linear with pressure (60->80 mm)",
+        "Manual override",
+    ]
+    _fp_index = (_fp_modes.index(s.footprint_mode)
+                 if s.footprint_mode in _fp_modes else 0)
     s.footprint_mode = container.radio(
         "Footprint diameter on hull",
-        ["Linear with pressure (60->80 mm)", "Manual override"],
-        index=0 if s.footprint_mode.startswith("Linear") else 1,
+        _fp_modes,
+        index=_fp_index,
         key=k("footprint_mode"),
+        help="Physical jet: the impact zone grows from the nozzle exit "
+             "diameter as the jet spreads over the standoff distance to "
+             "the hull — d_fp = exit_dia + 2·standoff·tan(spread). "
+             "Linear: a legacy curve tied only to pressure. "
+             "Manual: a fixed diameter.",
     )
     if s.footprint_mode == "Manual override":
         s.footprint_dia_mm_override = container.slider(
             "Footprint diameter (mm)", 20, 120, s.footprint_dia_mm_override,
             key=k("footprint_dia_mm_override"))
+    elif s.footprint_mode.startswith("Physical jet"):
+        s.jet_spread_deg = container.slider(
+            "Jet spread half-angle (°)", 0.0, 20.0, float(s.jet_spread_deg),
+            step=0.5, key=k("jet_spread_deg"),
+            help="Half-cone angle of the spreading free jet. Submerged "
+                 "water jets typically spread at 5–15°; calibrate against "
+                 "a measured spot size if you have one.")
+        _spread_mm = (s.footprint_dia() - s.nozzle_exit_mm) / 2.0
+        container.caption(
+            f"Footprint diameter on hull: **{s.footprint_dia():.1f} mm** "
+            f"(= {s.nozzle_exit_mm:.1f} mm exit + 2 × {_spread_mm:.1f} mm "
+            f"spread over {s.standoff_mm} mm standoff)")
+        if s.footprint_dia() < s.cell_size_mm:
+            container.warning(
+                f"Footprint ({s.footprint_dia():.1f} mm) is below the "
+                f"{s.cell_size_mm:g} mm hull-grid resolution, so the impact "
+                "sim deposits onto a single cell. The sensitivity chart "
+                "above still reflects the true sub-mm footprint; lower the "
+                "grid resolution, or raise the spread angle / standoff, to "
+                "resolve it on the grid.")
     else:
         container.caption(f"Footprint diameter on hull: **{s.footprint_dia():.1f} mm**")
     s.pressure_profile = container.radio(
@@ -371,14 +431,33 @@ def _plot_side_impl(s: Scenario) -> plt.Figure:
         facecolor="#cfe3f5", edgecolor="#1f77b4",
     ))
     ax.text(0, s.standoff_mm + disc_h / 2, "disc", ha="center", va="center", fontsize=9)
+    fp_d = s.footprint_dia()
+    d0 = s.nozzle_exit_mm
     for sign in (-1, +1):
         nx = sign * s.nozzle_radius_mm
         end_x = nx - sign * s.standoff_mm * math.tan(math.radians(s.nozzle_cant_deg))
+        # Spreading jet cone: starts at the nozzle exit diameter d0 at the
+        # disc face and widens to the footprint diameter at the hull. The
+        # cone is built around the (canted) jet axis from exit to footprint.
+        cone = mpatches.Polygon(
+            [(nx - d0 / 2, s.standoff_mm), (nx + d0 / 2, s.standoff_mm),
+             (end_x + fp_d / 2, 0), (end_x - fp_d / 2, 0)],
+            closed=True, facecolor="#ff7f0e", alpha=0.22, edgecolor="none",
+        )
+        ax.add_patch(cone)
+        # Jet axis (nozzle exit centre -> footprint centre).
         ax.plot([nx, end_x], [s.standoff_mm, 0], color="#ff7f0e", lw=1.5)
+        # Footprint on the hull.
         ax.add_patch(mpatches.Ellipse(
-            (end_x, 0), s.footprint_dia(), 4,
-            facecolor="#ff7f0e", alpha=0.4, edgecolor="none",
+            (end_x, 0), fp_d, 4,
+            facecolor="#ff7f0e", alpha=0.55, edgecolor="none",
         ))
+    # Label the footprint diameter under the right-hand jet.
+    fp_cx = s.nozzle_radius_mm - s.standoff_mm * math.tan(math.radians(s.nozzle_cant_deg))
+    ax.annotate("", xy=(fp_cx - fp_d / 2, -8), xytext=(fp_cx + fp_d / 2, -8),
+                arrowprops=dict(arrowstyle="<->", color="#ff7f0e", lw=1.0))
+    ax.text(fp_cx, -12, f"footprint {fp_d:.0f} mm",
+            color="#d9660a", ha="center", va="top", fontsize=8)
     ax.annotate("", xy=(-s.disc_diameter_mm / 2 - 20, 0),
                 xytext=(-s.disc_diameter_mm / 2 - 20, s.standoff_mm),
                 arrowprops=dict(arrowstyle="<->", color="#333"))
@@ -387,11 +466,11 @@ def _plot_side_impl(s: Scenario) -> plt.Figure:
     ax.text(s.nozzle_radius_mm + 20, s.standoff_mm * 0.6,
             f"{s.nozzle_cant_deg}°", color="#ff7f0e", fontsize=9)
     ax.set_xlim(-s.disc_diameter_mm / 2 - 80, s.disc_diameter_mm / 2 + 80)
-    ax.set_ylim(-15, s.standoff_mm + disc_h + 20)
+    ax.set_ylim(-26, s.standoff_mm + disc_h + 20)
     ax.set_aspect("equal")
     ax.set_xlabel("Across disc (mm)")
     ax.set_ylabel("Height (mm)")
-    ax.set_title("Side cross-section")
+    ax.set_title("Side cross-section — spreading jet")
     ax.grid(True, alpha=0.3)
     return fig
 
@@ -402,11 +481,92 @@ def plot_side(s: Scenario) -> plt.Figure:
 
 
 # -----------------------------------------------------------------------------
+# Footprint sensitivity: impact-zone diameter vs standoff & nozzle exit dia
+# -----------------------------------------------------------------------------
+@st.cache_data(show_spinner=False)
+def plot_footprint_sensitivity_cached(key: tuple, _scen_bytes: bytes) -> plt.Figure:
+    import pickle
+    return _plot_footprint_sensitivity_impl(pickle.loads(_scen_bytes))
+
+
+def _plot_footprint_sensitivity_impl(s: Scenario) -> plt.Figure:
+    """
+    Capture how the impact-zone diameter responds to the two physical
+    drivers: nozzle exit diameter and standoff distance to the hull.
+    Footprint area ∝ diameter², so the right panel reports the relative
+    cleaning-energy density (∝ 1/area) the jet delivers.
+    """
+    spread = math.tan(math.radians(s.jet_spread_deg))
+
+    def fp(d0: float, standoff: float) -> float:
+        return d0 + 2.0 * standoff * spread
+
+    standoffs = np.linspace(5, 60, 80)
+    exit_dias = sorted({0.5, 1.0, 1.5, 2.5, 4.0, float(s.nozzle_exit_mm)})
+
+    fig, (axd, axe) = plt.subplots(1, 2, figsize=(9.5, 3.8))
+
+    # Left: footprint diameter vs standoff, one curve per exit diameter.
+    for d0 in exit_dias:
+        is_current = abs(d0 - s.nozzle_exit_mm) < 1e-6
+        axd.plot(standoffs, [fp(d0, L) for L in standoffs],
+                 lw=2.2 if is_current else 1.2,
+                 color="#d9660a" if is_current else "#9aa0a6",
+                 label=f"exit {d0:.1f} mm" + (" (current)" if is_current else ""),
+                 zorder=3 if is_current else 2)
+    cur_fp = fp(s.nozzle_exit_mm, s.standoff_mm)
+    axd.scatter([s.standoff_mm], [cur_fp], color="#d9660a", s=55, zorder=4,
+                edgecolor="white", linewidth=1.0)
+    axd.annotate(f"{cur_fp:.0f} mm",
+                 xy=(s.standoff_mm, cur_fp),
+                 xytext=(6, 8), textcoords="offset points",
+                 color="#d9660a", fontsize=9, fontweight="bold")
+    axd.axvline(s.standoff_mm, color="#d9660a", ls=":", lw=0.8, alpha=0.6)
+    axd.set_xlabel("Standoff to hull (mm)")
+    axd.set_ylabel("Impact-zone diameter (mm)")
+    axd.set_title("Footprint vs standoff")
+    axd.legend(fontsize=7, loc="upper left", framealpha=0.9)
+    axd.grid(True, alpha=0.3)
+
+    # Right: relative energy density (∝ 1/footprint area) vs standoff.
+    base = fp(s.nozzle_exit_mm, s.standoff_mm)
+    for d0 in exit_dias:
+        is_current = abs(d0 - s.nozzle_exit_mm) < 1e-6
+        dens = [(base / fp(d0, L)) ** 2 for L in standoffs]
+        axe.plot(standoffs, dens,
+                 lw=2.2 if is_current else 1.2,
+                 color="#1f77b4" if is_current else "#bcd2e8",
+                 label=f"exit {d0:.1f} mm" + (" (current)" if is_current else ""),
+                 zorder=3 if is_current else 2)
+    axe.axhline(1.0, color="#888", ls="--", lw=0.8)
+    axe.axvline(s.standoff_mm, color="#1f77b4", ls=":", lw=0.8, alpha=0.6)
+    axe.scatter([s.standoff_mm], [1.0], color="#1f77b4", s=55, zorder=4,
+                edgecolor="white", linewidth=1.0)
+    axe.set_xlabel("Standoff to hull (mm)")
+    axe.set_ylabel("Relative energy density (× current)")
+    axe.set_title("Energy density ∝ 1 / area")
+    axe.legend(fontsize=7, loc="upper right", framealpha=0.9)
+    axe.grid(True, alpha=0.3)
+
+    fig.suptitle(
+        f"Impact zone driven by exit dia & standoff "
+        f"(spread half-angle {s.jet_spread_deg:.1f}°)",
+        fontsize=10)
+    fig.tight_layout(rect=(0, 0, 1, 0.94))
+    return fig
+
+
+def plot_footprint_sensitivity(s: Scenario) -> plt.Figure:
+    import pickle
+    return plot_footprint_sensitivity_cached(scenario_key(s), pickle.dumps(s))
+
+
+# -----------------------------------------------------------------------------
 # Footprint stencil
 # -----------------------------------------------------------------------------
 def footprint_stencil(s: Scenario) -> np.ndarray:
     r_mm = s.footprint_dia() / 2.0
-    r_cells = r_mm / CELL_SIZE_MM
+    r_cells = r_mm / s.cell_size_mm
     half = int(math.ceil(r_cells)) + 1
     yy, xx = np.ogrid[-half:half + 1, -half:half + 1]
     r2 = (xx ** 2 + yy ** 2).astype(np.float32)
@@ -552,12 +712,13 @@ def simulate_pressure(s: Scenario, t_stop_s: float | None = None
     full_extent = s.sim_length_mm + array_span_y + 2 * margin_mm
     width_extent = array_span_x + 2 * margin_mm
 
-    nx = int(width_extent / CELL_SIZE_MM)
-    ny = int(full_extent / CELL_SIZE_MM)
+    cell = s.cell_size_mm
+    nx = int(width_extent / cell)
+    ny = int(full_extent / cell)
     grid = np.zeros((ny, nx), dtype=np.float32)
 
     dt_rot = math.radians(5.0) / max(omega_rad_s, 1e-6)
-    dt_trav = 0.5 * CELL_SIZE_MM / max(rov_speed_mm_s, 1e-6)
+    dt_trav = 0.5 * cell / max(rov_speed_mm_s, 1e-6)
     dt = min(dt_rot, dt_trav)
     total_time_full = s.sim_length_mm / max(rov_speed_mm_s, 1e-6)
     total_time = total_time_full if t_stop_s is None else min(t_stop_s, total_time_full)
@@ -569,49 +730,90 @@ def simulate_pressure(s: Scenario, t_stop_s: float | None = None
     sh, sw = stencil.shape
     rr = sh // 2
     p_dt = float(s.pressure_bar) * dt
-    weighted_stencil = stencil * p_dt
+    weighted_stencil = (stencil * p_dt).astype(np.float32)
 
     x0 = -width_extent / 2
     array_leading_y = min(rys) - s.disc_diameter_mm / 2
     array_y_offset_init = -margin_mm - array_leading_y
-    phases = [2 * math.pi * i / max(len(rotated), 1) for i in range(len(rotated))]
 
-    for step in range(n_steps):
-        t = step * dt
-        array_y = array_y_offset_init + rov_speed_mm_s * t
-        for di, (rx, ry, direction) in enumerate(rotated):
-            phase = phases[di] + direction * omega_rad_s * t
-            dcx = rx
-            dcy = ry + array_y
-            for kn in range(s.n_nozzles):
-                theta = phase + 2 * math.pi * kn / s.n_nozzles
-                ir = s.impact_radius_mm()
-                lx = ir * math.cos(theta)
-                ly = ir * math.sin(theta)
-                gx = lx * cos_t - ly * sin_t
-                gy = lx * sin_t + ly * cos_t
-                nx_mm = dcx + gx
-                ny_mm = dcy + gy
-                ix = int(round((nx_mm - x0) / CELL_SIZE_MM))
-                iy = int(round((ny_mm - 0.0) / CELL_SIZE_MM))
-                xs_ = ix - rr; ys_ = iy - rr
-                xe_ = xs_ + sw; ye_ = ys_ + sh
-                gx0 = max(xs_, 0); gy0 = max(ys_, 0)
-                gx1 = min(xe_, nx); gy1 = min(ye_, ny)
-                if gx1 <= gx0 or gy1 <= gy0:
-                    continue
-                mx0 = gx0 - xs_; my0 = gy0 - ys_
-                mx1 = mx0 + (gx1 - gx0); my1 = my0 + (gy1 - gy0)
-                grid[gy0:gy1, gx0:gx1] += weighted_stencil[my0:my1, mx0:mx1]
+    # ---- Vectorised nozzle impact positions -------------------------------
+    # Compute every (step, disc, nozzle) impact centre as NumPy arrays, then
+    # scatter-add the footprint stencil in one pass per stencil cell. This
+    # replaces the former triple Python loop and is what keeps fine grids
+    # (1–2 mm) responsive.
+    n_discs = len(rotated)
+    if not (n_discs == 0 or s.n_nozzles == 0 or n_steps == 0):
+        ir = s.impact_radius_mm()
+        steps = np.arange(n_steps, dtype=np.float64)
+        t = steps * dt                                   # (S,)
+        array_y = array_y_offset_init + rov_speed_mm_s * t  # (S,)
+
+        rx = np.array([r[0] for r in rotated])           # (D,)
+        ry = np.array([r[1] for r in rotated])           # (D,)
+        direction = np.array([r[2] for r in rotated])    # (D,)
+        phase0 = (2 * np.pi * np.arange(n_discs)
+                  / max(n_discs, 1))                      # (D,)
+        kn = np.arange(s.n_nozzles)                       # (N,)
+        nozzle_off = 2 * np.pi * kn / s.n_nozzles         # (N,)
+
+        # theta[s, d, n]
+        phase = (phase0[None, :]
+                 + direction[None, :] * omega_rad_s * t[:, None])  # (S, D)
+        theta = phase[:, :, None] + nozzle_off[None, None, :]      # (S, D, N)
+
+        lx = ir * np.cos(theta)
+        ly = ir * np.sin(theta)
+        gx = lx * cos_t - ly * sin_t
+        gy = lx * sin_t + ly * cos_t
+
+        nx_mm = rx[None, :, None] + gx                            # (S, D, N)
+        ny_mm = (ry[None, :, None] + array_y[:, None, None] + gy)  # (S, D, N)
+
+        ix = np.round((nx_mm - x0) / cell).astype(np.int64).ravel()
+        iy = np.round(ny_mm / cell).astype(np.int64).ravel()
+
+        # Every nozzle hit deposits the SAME weighted stencil, so the total
+        # exposure is the 2-D convolution of a "hit-count" grid with that
+        # stencil — independent of the number of timesteps and the stencil
+        # size, which is what keeps fine grids fast.
+        #
+        # We bin hits into a grid padded by rr on every side so that a hit
+        # whose centre sits just off the real grid still contributes its
+        # overlapping stencil tail (matching the original clipped-deposit
+        # loop). Hits whose stencil cannot touch the grid at all are dropped.
+        pix = ix + rr            # column in the padded grid
+        piy = iy + rr            # row in the padded grid
+        pny = ny + 2 * rr
+        pnx = nx + 2 * rr
+        keep = (pix >= 0) & (pix < pnx) & (piy >= 0) & (piy < pnx)
+        keep &= (piy < pny)
+        hit = np.bincount((piy[keep] * pnx + pix[keep]),
+                          minlength=pny * pnx).astype(np.float32).reshape(pny, pnx)
+
+        if sh == 1 and sw == 1:
+            # Single-cell footprint (sub-resolution jet): no spread to apply.
+            grid += hit[rr:rr + ny, rr:rr + nx] * weighted_stencil[0, 0]
+        else:
+            # FFT convolution: O(MN log MN), stencil-size independent.
+            fy = pny + sh - 1
+            fx = pnx + sw - 1
+            H = np.fft.rfft2(hit, s=(fy, fx))
+            K = np.fft.rfft2(weighted_stencil, s=(fy, fx))
+            conv = np.fft.irfft2(H * K, s=(fy, fx))
+            # The hit at padded (piy, pix) deposits stencil cell (dy, dx) at
+            # padded (piy+dy-rr, pix+dx-rr); the full convolution places it at
+            # conv[piy+dy, pix+dx]. The real grid cell (i, j) corresponds to
+            # padded (i+rr, j+rr), so it reads conv[i+2*rr, j+2*rr].
+            grid += conv[2 * rr:2 * rr + ny, 2 * rr:2 * rr + nx].astype(np.float32)
 
     y_strip_start = 0
-    y_strip_end = int((s.sim_length_mm + array_span_y) / CELL_SIZE_MM)
-    x_strip_start = int(margin_mm / CELL_SIZE_MM)
-    x_strip_end = int((margin_mm + array_span_x) / CELL_SIZE_MM)
+    y_strip_end = int((s.sim_length_mm + array_span_y) / cell)
+    x_strip_start = int(margin_mm / cell)
+    x_strip_end = int((margin_mm + array_span_x) / cell)
     strip = grid[y_strip_start:y_strip_end, x_strip_start:x_strip_end]
 
-    core_y0 = int(array_span_y / CELL_SIZE_MM)
-    core_y1 = int(s.sim_length_mm / CELL_SIZE_MM)
+    core_y0 = int(array_span_y / cell)
+    core_y1 = int(s.sim_length_mm / cell)
     if core_y1 <= core_y0:
         core_y0, core_y1 = 0, strip.shape[0]
     core_x0 = 0
@@ -638,7 +840,7 @@ def simulate_pressure(s: Scenario, t_stop_s: float | None = None
         "coverage_pct": float((region >= s.clean_threshold).mean() * 100.0)
                        if region.size else 0.0,
         "missed_pct": float((region == 0).mean() * 100.0) if region.size else 0.0,
-        "region_area_mm2": float(region.size * CELL_SIZE_MM * CELL_SIZE_MM),
+        "region_area_mm2": float(region.size * cell * cell),
         "total_time_s": total_time_full,
     }
     return strip, metrics, core_box
@@ -738,7 +940,7 @@ def plot_motion_fast(s: Scenario, t_now_s: float,
         rxs_rot = [r[0] for r in rotated]
         array_span_x = max(rxs_rot) - min(rxs_rot) + s.disc_diameter_mm
         extent = [-array_span_x / 2, array_span_x / 2,
-                  cumulative_strip.shape[0] * CELL_SIZE_MM, 0]
+                  cumulative_strip.shape[0] * s.cell_size_mm, 0]
         vmax = max(float(cumulative_strip.max()), 1e-6)
         ax.imshow(cumulative_strip, extent=extent, aspect="auto",
                   cmap="viridis", vmin=0, vmax=vmax, alpha=0.7, zorder=0)
@@ -1178,20 +1380,21 @@ def render_result(s: Scenario, strip: np.ndarray, m: dict,
 
     vmax = vmax_shared if vmax_shared is not None else max(strip.max(), 1e-6)
     array_span_x = m["array_span_x_mm"]
-    extent = [-array_span_x / 2, array_span_x / 2, strip.shape[0] * CELL_SIZE_MM, 0]
+    cell = s.cell_size_mm
+    extent = [-array_span_x / 2, array_span_x / 2, strip.shape[0] * cell, 0]
 
     fig, ax = plt.subplots(figsize=(8, 3.6))
     im = ax.imshow(strip, extent=extent, aspect="auto",
                    cmap="viridis", vmin=0, vmax=vmax)
     if s.steady_state_only:
-        core_y0_mm = cy0 * CELL_SIZE_MM
-        core_y1_mm = cy1 * CELL_SIZE_MM
+        core_y0_mm = cy0 * cell
+        core_y1_mm = cy1 * cell
         ax.add_patch(mpatches.Rectangle(
             (extent[0], 0), extent[1] - extent[0], core_y0_mm,
             facecolor="white", alpha=0.45, edgecolor="none"))
         ax.add_patch(mpatches.Rectangle(
             (extent[0], core_y1_mm), extent[1] - extent[0],
-            strip.shape[0] * CELL_SIZE_MM - core_y1_mm,
+            strip.shape[0] * cell - core_y1_mm,
             facecolor="white", alpha=0.45, edgecolor="none"))
         ax.axhline(core_y0_mm, color="red", lw=0.8, ls="--")
         ax.axhline(core_y1_mm, color="red", lw=0.8, ls="--")
@@ -1202,8 +1405,8 @@ def render_result(s: Scenario, strip: np.ndarray, m: dict,
     container.pyplot(fig, clear_figure=True)
 
     region = strip[cy0:cy1, cx0:cx1] if s.steady_state_only else strip
-    region_extent_y = (cy1 - cy0) * CELL_SIZE_MM if s.steady_state_only \
-        else strip.shape[0] * CELL_SIZE_MM
+    region_extent_y = (cy1 - cy0) * cell if s.steady_state_only \
+        else strip.shape[0] * cell
     fig_t, ax_t = plt.subplots(figsize=(8, 2.8))
     ax_t.imshow(
         (region >= s.clean_threshold).astype(np.float32),
@@ -1245,6 +1448,19 @@ if not compare_mode:
         with right:
             st.subheader("Side view (one disc)")
             st.pyplot(plot_side(scen), clear_figure=False)
+
+        if scen.footprint_mode.startswith("Physical jet"):
+            st.subheader("Impact zone vs nozzle exit & standoff")
+            st.caption(
+                "The impact-zone diameter is "
+                f"**{scen.footprint_dia():.1f} mm** = "
+                f"{scen.nozzle_exit_mm:.1f} mm nozzle exit + "
+                f"2 × {scen.standoff_mm} mm standoff × "
+                f"tan({scen.jet_spread_deg:.1f}°). A larger standoff or "
+                "spread angle widens the footprint and dilutes the "
+                "cleaning energy (∝ 1/area); a tighter exit or shorter "
+                "standoff concentrates it.")
+            st.pyplot(plot_footprint_sensitivity(scen), clear_figure=False)
 
         st.divider()
         if st.button("Run full simulation", type="primary"):
@@ -1904,8 +2120,18 @@ playback.
 pressure sim up to the current time; tick *Show cached underlay* to
 display it. The cache is invalidated when scenario parameters change.
 
-**Footprint diameter on hull.** Linear with pressure (60 mm at 50 bar →
-80 mm at 600 bar) or manual override.
+**Footprint diameter on hull.** Three modes:
+
+- *Physical jet (default).* The impact zone is set by the spreading free
+  jet: `d_fp = nozzle_exit_dia + 2 · standoff · tan(spread_half_angle)`.
+  Both the **nozzle exit diameter** and the **distance to the hull
+  (standoff)** drive the footprint directly. Because the deposited
+  cleaning energy spreads over `π·(d_fp/2)²`, a wider footprint dilutes
+  the bar·s per cell — the *Impact zone vs nozzle exit & standoff* chart
+  visualises this trade-off, and the side cross-section draws the jet as
+  a cone widening from the exit diameter to the hull footprint.
+- *Linear with pressure (legacy).* 60 mm at 50 bar → 80 mm at 600 bar.
+- *Manual override.* A fixed diameter.
 
 **Cant correction.** Canted nozzles converge the impingement ring inward
 by `standoff · tan(cant)`.
