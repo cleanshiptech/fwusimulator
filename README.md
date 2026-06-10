@@ -108,7 +108,9 @@ The model is geometric and time-integrated. It does not yet capture jet
 pressure decay along the jet axis, hull curvature, biofouling resistance,
 or ROV pitch/roll. The cant correction shifts the impingement ring inward
 by `standoff · tan(cant)`. The Gaussian footprint option uses 2σ at the
-stated footprint diameter.
+stated footprint diameter and is **energy-normalised** to deposit the same
+total per pass as the uniform disc (it concentrates the same energy toward
+the centre, raising the peak, rather than discarding ~half of it).
 
 **Physical-jet footprint.** In the default footprint mode the impact-zone
 diameter is `nozzle_exit_dia + 2·standoff·tan(spread_half_angle)`, so a
