@@ -74,23 +74,23 @@ class Scenario:
     array_width_mm: int = 1700
     n_row1: int = 4
     n_row2: int = 3
-    disc_pitch_mm: int = 380
-    row_pitch_mm: int = 320
+    disc_pitch_mm: int = 520
+    row_pitch_mm: int = 260
     yaw_deg: float = 0.0
 
     # Disc & nozzles
-    disc_diameter_mm: int = 360
+    disc_diameter_mm: int = 300
     n_nozzles: int = 3
     nozzle_radius_mm: int = 140
     nozzle_cant_deg: int = 10
-    standoff_mm: int = 18
+    standoff_mm: int = 15
     counter_rotate: bool = True
 
     # Operating point
-    rpm: int = 600
-    rov_speed_kn: float = 1.5
-    pressure_bar: int = 200
-    nozzle_exit_mm: float = 1.5
+    rpm: int = 850
+    rov_speed_kn: float = 0.3
+    pressure_bar: int = 70
+    nozzle_exit_mm: float = 1.3
 
     # Jet footprint model
     footprint_mode: str = "Physical jet (exit dia + standoff)"
@@ -106,7 +106,7 @@ class Scenario:
     # Cleaning criterion: an intensity GATE (jet stagnation pressure at the
     # hull must exceed a removal threshold for the fouling type) plus a DOSE
     # gate (a minimum number of nozzle passes over the cell).
-    removal_pressure_bar: float = 30.0   # P_stag at hull needed to lift fouling
+    removal_pressure_bar: float = 15.0   # P_stag at hull needed to lift fouling
     min_passes: int = 2                  # passes required once above the gate
     jet_core_factor: float = 6.0         # potential-core length = factor · exit_dia
 
@@ -304,7 +304,7 @@ def scenario_controls(prefix: str, defaults: Scenario, container) -> Scenario:
         "hull) AND enough **dose** (passes). Intensity is the gate: below it, "
         "no amount of dwell removes fouling.")
     _foul_presets = {
-        "Soft biofilm / slime": 20.0,
+        "Soft biofilm / slime": 15.0,
         "Light weed / early growth": 60.0,
         "Hard calcareous / barnacle": 150.0,
         "Custom": None,
