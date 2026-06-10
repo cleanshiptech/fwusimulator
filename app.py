@@ -785,8 +785,7 @@ def simulate_pressure(s: Scenario, t_stop_s: float | None = None
         piy = iy + rr            # row in the padded grid
         pny = ny + 2 * rr
         pnx = nx + 2 * rr
-        keep = (pix >= 0) & (pix < pnx) & (piy >= 0) & (piy < pnx)
-        keep &= (piy < pny)
+        keep = ((pix >= 0) & (pix < pnx) & (piy >= 0) & (piy < pny))
         hit = np.bincount((piy[keep] * pnx + pix[keep]),
                           minlength=pny * pnx).astype(np.float32).reshape(pny, pnx)
 
