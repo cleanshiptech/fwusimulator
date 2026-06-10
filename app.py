@@ -666,8 +666,11 @@ def single_disc_coverage(s: Scenario) -> dict:
     rov_mm_s = max(one.rov_speed_kn * KNOTS_TO_MPS * 1000.0, 1e-6)
     rev_s = one.rpm / 60.0
     advance_per_rev = rov_mm_s / max(rev_s, 1e-6)
-    # Simulate enough length to see several full revolutions sweep past.
-    one.sim_length_mm = int(max(6 * advance_per_rev, 2 * one.disc_diameter_mm, 400))
+    # Simulate enough length to show the ring overlap pattern over a few
+    # revolutions, but keep the strip from becoming an extreme tall sliver:
+    # one disc-width across is enough context, ~the same along-track.
+    one.sim_length_mm = int(min(max(5 * advance_per_rev, 1.4 * one.disc_diameter_mm),
+                                3.0 * one.disc_diameter_mm))
     one.steady_state_only = False
 
     strip, m, box = simulate_pressure(one)
@@ -716,7 +719,7 @@ def plot_single_disc_coverage(s: Scenario) -> tuple[plt.Figure, dict]:
     ny, nx = touched.shape
     extent = [-nx / 2 * cell, nx / 2 * cell, ny * cell, 0]
 
-    fig, ax = plt.subplots(figsize=(4.2, 4.4))
+    fig, ax = plt.subplots(figsize=(4.6, 4.0))
     # Touched cells in solid colour over an untouched background.
     ax.imshow(touched.astype(float), extent=extent, aspect="equal",
               cmap="Greens", vmin=0, vmax=1.4, interpolation="nearest")
@@ -1930,53 +1933,62 @@ if not compare_mode:
     # TAB 1 — Impact simulation
     # =============================================================
     with tab_impact:
-        col_top, col_cov, col_side = st.columns([1.1, 0.8, 1.0])
+        # Row 1 — the short schematics, balanced heights.
+        col_top, col_side, col_spray = st.columns(3)
         with col_top:
             st.subheader("Top-down view")
             st.pyplot(plot_topdown(scen), clear_figure=False)
-        with col_cov:
-            st.subheader("Single-disc coverage")
+        with col_side:
+            st.subheader("Side view (one disc)")
+            st.pyplot(plot_side(scen), clear_figure=False)
+        with col_spray:
+            st.subheader("Spray profile")
+            st.pyplot(plot_spray_profile(scen), clear_figure=False)
+            st.caption(
+                "One nozzle jet at true mm scale (the side view is dominated "
+                "by the disc width).")
+
+        st.divider()
+
+        # Row 2 — single-disc coverage map beside its gap metrics/verdict.
+        st.subheader("Single-disc coverage — ring gap check")
+        cov_map, cov_info = st.columns([1.0, 1.2])
+        with cov_map:
             fig_cov, cov = plot_single_disc_coverage(scen)
             st.pyplot(fig_cov, clear_figure=True)
             st.caption(
                 "Green = swept by ONE disc as it advances. A disc cleans only "
                 "its **ring**, not a filled circle; adjacent discs/rows fill "
                 "the rest. Continuous ring = gap-free; separated = gaps.")
-        with col_side:
-            st.subheader("Side view (one disc)")
-            st.pyplot(plot_side(scen), clear_figure=False)
-            st.caption(
-                "Zoomed spray profile — the same jet at true mm scale "
-                "(the side view above is dominated by the disc width).")
-            st.pyplot(plot_spray_profile(scen), clear_figure=False)
-
-        # Single-disc gap metrics + verdict, as a compact strip below the row.
-        gk1, gk2, gk3, gk4 = st.columns(4)
-        gk1.metric("Forward advance / rev", f"{cov['advance_per_rev_mm']:.1f} mm")
-        gk2.metric("Effective pitch", f"{cov['eff_pitch_mm']:.1f} mm",
-                   help=f"= advance/rev ÷ {cov['n_nozzles']} nozzles. The "
-                        "along-track spacing between successive nozzle passes "
-                        "over a fixed point.")
-        gk3.metric("Footprint", f"{cov['footprint_mm']:.1f} mm")
-        _m = cov["overlap_margin_mm"]
-        gk4.metric("Overlap margin", f"{_m:+.1f} mm",
-                   delta="overlap" if _m >= 0 else "gap",
-                   delta_color="normal" if _m >= 0 else "inverse",
-                   help="footprint − effective pitch. Positive = successive "
-                        "passes overlap (gap-free); negative = a gap of this "
-                        "width opens between rings.")
-        if cov["overlap"]:
-            st.success(
-                f"Gap-free along-track: effective pitch "
-                f"{cov['eff_pitch_mm']:.1f} mm < footprint "
-                f"{cov['footprint_mm']:.1f} mm, so successive passes overlap. "
-                "No 'circles' marching forward.")
-        else:
-            st.warning(
-                f"Gap risk: effective pitch {cov['eff_pitch_mm']:.1f} mm "
-                f"≥ footprint {cov['footprint_mm']:.1f} mm — successive passes "
-                "separate into discrete rings. Slow the traverse, add nozzles, "
-                "or raise RPM to close the gap.")
+        with cov_info:
+            gk1, gk2 = st.columns(2)
+            gk1.metric("Forward advance / rev",
+                       f"{cov['advance_per_rev_mm']:.1f} mm")
+            gk2.metric("Effective pitch", f"{cov['eff_pitch_mm']:.1f} mm",
+                       help=f"= advance/rev ÷ {cov['n_nozzles']} nozzles. The "
+                            "along-track spacing between successive nozzle "
+                            "passes over a fixed point.")
+            gk3, gk4 = st.columns(2)
+            gk3.metric("Footprint", f"{cov['footprint_mm']:.1f} mm")
+            _m = cov["overlap_margin_mm"]
+            gk4.metric("Overlap margin", f"{_m:+.1f} mm",
+                       delta="overlap" if _m >= 0 else "gap",
+                       delta_color="normal" if _m >= 0 else "inverse",
+                       help="footprint − effective pitch. Positive = "
+                            "successive passes overlap (gap-free); negative = "
+                            "a gap of this width opens between rings.")
+            if cov["overlap"]:
+                st.success(
+                    f"Gap-free along-track: effective pitch "
+                    f"{cov['eff_pitch_mm']:.1f} mm < footprint "
+                    f"{cov['footprint_mm']:.1f} mm, so successive passes "
+                    "overlap. No 'circles' marching forward.")
+            else:
+                st.warning(
+                    f"Gap risk: effective pitch {cov['eff_pitch_mm']:.1f} mm "
+                    f"≥ footprint {cov['footprint_mm']:.1f} mm — successive "
+                    "passes separate into discrete rings. Slow the traverse, "
+                    "add nozzles, or raise RPM to close the gap.")
 
         st.divider()
         if scen.footprint_mode.startswith("Physical jet"):
