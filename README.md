@@ -63,6 +63,31 @@ The **delivered-pressure map** (which saturates to a near-flat slab, since
 peak pressure is ~the same everywhere a cell is touched) and the **binary
 cleaned map** live in the Advanced expander.
 
+## Flow-limited pressure (nozzle pressure is derived, not set)
+
+Nozzle pressure is **not** a free input — the pumps deliver a fixed total
+flow that is split across every nozzle, and each nozzle's pressure follows
+from the orifice law:
+
+```
+Q = K · d² · √p        (Q L/min, d mm exit, p bar;  K ≈ 0.642)
+```
+
+fitted to the Denjet 546.xxx.A3 nozzle datasheet to <1 %. Inverting for one
+nozzle's share of the total flow gives the nozzle pressure:
+
+```
+p = ( (total_flow / n_nozzles_total) / (K · d²) )²
+```
+
+So **adding nozzles or widening the exit lowers the pressure** at fixed pump
+flow. With 2 Denjet pumps (~270 L/min) and a 7-disc array at 1.3 mm exits,
+going from **3 → 4 nozzles per disc drops nozzle pressure ~140 → ~79 bar**
+(and the delivered pressure at the hull with it) — a real trade-off between
+coverage (more nozzles) and intensity (pressure per nozzle) that the sidebar
+shows live. Set the total pump flow and the exit diameter; pressure is
+reported, not dialled.
+
 ## Parameters
 
 Array geometry
@@ -74,8 +99,9 @@ Disc & nozzles
   optional adjacent-disc counter-rotation
 
 Operating point
-- Disc RPM, ROV traverse speed (knots), jet pressure (bar),
-  nozzle exit diameter (mm)
+- Disc RPM, ROV traverse speed (knots), nozzle exit diameter (mm),
+  total pump flow (L/min). Nozzle pressure is derived from the flow (see
+  "Flow-limited pressure" above), not entered.
 
 Footprint model
 - Footprint diameter on hull, three modes:

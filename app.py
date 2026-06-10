@@ -60,6 +60,14 @@ st.caption(
 )
 
 KNOTS_TO_MPS = 0.514444
+
+# Orifice flow constant: Q = ORIFICE_K · d² · √p, with Q in L/min, the
+# nozzle exit diameter d in mm and the pressure p in bar. Fitted to the
+# Denjet nozzle datasheet (546.xxx.A3 series) to <1% across bores 0.6–1.46 mm
+# and pressures 40–300 bar. Used to DERIVE nozzle pressure from the fixed
+# pump flow split across all nozzles (more/larger nozzles → lower pressure).
+ORIFICE_K = 0.642
+
 # Hull-grid resolution is now per-scenario (Scenario.cell_size_mm). This
 # constant is kept only as a legacy default; the sim/render paths read the
 # scenario value so the grid can be refined to 1–2 mm for small footprints.
@@ -91,8 +99,12 @@ class Scenario:
     # Operating point
     rpm: int = 850
     rov_speed_kn: float = 0.3
-    pressure_bar: int = 70
     nozzle_exit_mm: float = 1.3
+    # Nozzle pressure is DERIVED, not set: the pumps deliver a fixed total
+    # flow, which is split across all nozzles, and each nozzle's pressure
+    # follows from the orifice law Q = K·d²·√p. So adding nozzles or widening
+    # the exit lowers the pressure. total_flow_lpm is the pump capacity.
+    total_flow_lpm: float = 270.0   # 2 Denjet pumps
 
     # Jet footprint model
     footprint_mode: str = "Physical jet (exit dia + standoff)"
@@ -114,6 +126,29 @@ class Scenario:
 
     # Post-processing
     steady_state_only: bool = True
+
+    @property
+    def n_nozzles_total(self) -> int:
+        """Total nozzles in the array = discs × nozzles per disc."""
+        return (self.n_row1 + self.n_row2) * self.n_nozzles
+
+    @property
+    def flow_per_nozzle_lpm(self) -> float:
+        """Pump flow divided evenly across every nozzle (L/min)."""
+        return self.total_flow_lpm / max(self.n_nozzles_total, 1)
+
+    @property
+    def pressure_bar(self) -> float:
+        """
+        Nozzle pressure DERIVED from the fixed pump flow. Inverting the
+        orifice law Q = K·d²·√p for one nozzle's share of the total flow:
+            p = ( q_per_nozzle / (K · d²) )².
+        More nozzles or a larger exit ⇒ more total orifice area ⇒ lower
+        pressure for the same pump flow.
+        """
+        d = max(self.nozzle_exit_mm, 1e-6)
+        q = self.flow_per_nozzle_lpm
+        return (q / (ORIFICE_K * d ** 2)) ** 2
 
     def stagnation_pressure_bar(self) -> float:
         """
@@ -161,7 +196,7 @@ def scenario_key(s: Scenario) -> tuple:
             s.nozzle_radius_mm, s.nozzle_cant_deg, s.standoff_mm,
             s.counter_rotate, s.pressure_bar, s.footprint_mode,
             s.footprint_dia_mm_override, s.nozzle_exit_mm, s.jet_spread_deg,
-            s.cell_size_mm)
+            s.cell_size_mm, s.total_flow_lpm)
 
 
 def scenario_full_key(s: Scenario) -> tuple:
@@ -227,12 +262,24 @@ def scenario_controls(prefix: str, defaults: Scenario, container) -> Scenario:
     s.rov_speed_kn = container.slider(
         "ROV traverse speed (knots)", 0.1, 4.0, s.rov_speed_kn, step=0.1,
         key=k("rov_speed_kn"))
-    s.pressure_bar = container.slider(
-        "Jet pressure at nozzle (bar)", 50, 600, s.pressure_bar, step=10,
-        key=k("pressure_bar"))
     s.nozzle_exit_mm = container.slider(
         "Nozzle exit diameter (mm)", 0.5, 5.0, s.nozzle_exit_mm, step=0.1,
         key=k("nozzle_exit_mm"))
+    s.total_flow_lpm = container.slider(
+        "Total pump flow (L/min)", 50.0, 600.0, float(s.total_flow_lpm),
+        step=10.0, key=k("total_flow_lpm"),
+        help="Combined flow from the pumps (2 Denjet ≈ 270 L/min). This is "
+             "split evenly across all nozzles; the nozzle pressure is "
+             "DERIVED from it, not set directly.")
+    # Nozzle pressure is now a derived quantity — show it live so the
+    # flow→pressure coupling is explicit.
+    container.caption(
+        f"→ **{s.n_nozzles_total} nozzles** "
+        f"({s.n_row1 + s.n_row2} discs × {s.n_nozzles}) share "
+        f"{s.total_flow_lpm:.0f} L/min = "
+        f"**{s.flow_per_nozzle_lpm:.1f} L/min/nozzle** → nozzle pressure "
+        f"**{s.pressure_bar:.0f} bar** (orifice law Q = K·d²·√p). "
+        "Adding nozzles or widening the exit lowers this.")
 
     container.subheader("Jet footprint model")
     _grid_opts = [10.0, 5.0, 2.0, 1.0]
@@ -2586,7 +2633,7 @@ else:
     col_a_ctrl, col_b_ctrl = st.sidebar.columns(2)
     with col_a_ctrl.expander("Scenario A", expanded=True):
         scen_a = scenario_controls("A", Scenario(), col_a_ctrl)
-    default_b = Scenario(rov_speed_kn=1.0, rpm=800, pressure_bar=250)
+    default_b = Scenario(rov_speed_kn=1.0, rpm=800, total_flow_lpm=350.0)
     with col_b_ctrl.expander("Scenario B", expanded=True):
         scen_b = scenario_controls("B", default_b, col_b_ctrl)
 
