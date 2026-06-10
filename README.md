@@ -33,23 +33,35 @@ threshold you remove nothing no matter how long you dwell. The headline
    dominant levers (e.g. 100 bar at the nozzle through a 1.3 mm exit at
    18 mm standoff delivers only ~19 bar at the hull; shorten the standoff to
    8 mm and it delivers ~95 bar). Below the gate, cleaned area is 0 %.
-2. **Dose gate.** Among cells that clear the intensity gate, a cell counts
-   as cleaned once it receives at least the **minimum number of passes**.
+2. **Passes gate.** Among cells that clear the impact-pressure gate, a cell
+   counts as cleaned once it receives at least the **minimum number of
+   passes**.
+
+**Two quantities, two units — do not confuse them:**
+- **Impact pressure** (bar) — how *hard* the jet hits at any instant. This
+  is the gate. Shown in its own info box.
+- **Accumulated exposure** (bar·s) — pressure **× dwell time**, summed over
+  passes. Because the jet sweeps at ~12 m/s it dwells only ~0.5 ms on a spot
+  per pass, so an 18 bar jet accumulates well under 1 bar·s. These are
+  different dimensions (bar vs bar·s); a small bar·s next to an 18 bar impact
+  pressure is expected, not a contradiction.
 
 **How to compare configurations.** Calibrate the removal threshold to a run
-you *know* cleans your fouling (the sidebar shows the delivered pressure of
-the current jet live — set the threshold to that). Then change a parameter:
-if delivered pressure stays above the gate and cleaned-area rises, that
-change cleans *more*. Fouling presets (soft biofilm / light weed / hard
-calcareous) seed typical removal thresholds.
+you *know* cleans your fouling (the sidebar shows the impact pressure of the
+current jet live — set the threshold to that). Then change a parameter: if
+impact pressure stays above the gate and cleaned-area rises, that change
+cleans *more*. Fouling presets (soft biofilm / light weed / hard calcareous)
+seed typical removal thresholds.
 
-**The primary heatmap is the delivered-pressure map** (bar at the hull,
-per cell), with the removal threshold drawn as a contour — so you can see
-exactly which parts of the hull were exposed to enough pressure to clean.
-The pressure is highest at each footprint centre (the jet core) and falls
-toward the edges; the gate is applied per cell, so a cell counts as cleaned
-when it is *inside the contour* AND struck enough times. The bar·s exposure
-map is retained only as a diagnostic in the Advanced expander.
+**Primary heatmaps (side by side):**
+- **Passes per cell** — pure geometric coverage. The bright lattice is the
+  disc-to-disc overlap; dark is gaps / thin coverage.
+- **Accumulated exposure (bar·s)** — the same lattice weighted by how hard
+  each pass hit.
+
+The **delivered-pressure map** (which saturates to a near-flat slab, since
+peak pressure is ~the same everywhere a cell is touched) and the **binary
+cleaned map** live in the Advanced expander.
 
 ## Parameters
 
