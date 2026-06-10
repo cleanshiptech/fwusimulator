@@ -1202,8 +1202,13 @@ def simulate_pressure(s: Scenario, t_stop_s: float | None = None
     pressure_strip = peak_pressure[y_strip_start:y_strip_end,
                                    x_strip_start:x_strip_end]
 
+    # Steady-state core excludes BOTH transients. The entry transient fills
+    # the first array_span_y (array driving in). The EXIT transient — the
+    # trailing discs leaving — occupies roughly the last array_span_y/2 of the
+    # array's travel, so the upper bound is sim_length − array_span_y/2 (the
+    # old sim_length cutoff left that decay in, dragging the KPIs down).
     core_y0 = int(array_span_y / cell)
-    core_y1 = int(s.sim_length_mm / cell)
+    core_y1 = int((s.sim_length_mm - array_span_y / 2.0) / cell)
     if core_y1 <= core_y0:
         core_y0, core_y1 = 0, strip.shape[0]
     core_x0 = 0
@@ -1226,12 +1231,20 @@ def simulate_pressure(s: Scenario, t_stop_s: float | None = None
     # there clears the removal threshold AND it received >= min passes.
     p_stag = s.stagnation_pressure_bar()         # centreline (peak) delivered
     intensity_ok = p_stag >= s.removal_pressure_bar   # can ANY cell clean?
+    # `passes` is a convolution, so it is fractional at footprint edges. Treat
+    # < 0.5 of a pass as effectively unstruck ("untouched") so the three
+    # categories (cleaned / partial / untouched) partition the area exactly.
+    TOUCH = 0.5
     if region_passes.size:
-        cleaned_mask = ((region_pressure >= s.removal_pressure_bar)
+        touched_mask = region_passes >= TOUCH
+        cleaned_mask = (touched_mask
+                        & (region_pressure >= s.removal_pressure_bar)
                         & (region_passes >= s.min_passes))
         cleaned_pct = float(cleaned_mask.mean() * 100.0)
+        partial_pct = float((touched_mask & ~cleaned_mask).mean() * 100.0)
+        missed_pct = float((~touched_mask).mean() * 100.0)
     else:
-        cleaned_pct = 0.0
+        cleaned_pct = partial_pct = missed_pct = 0.0
 
     metrics = {
         "rov_speed_mm_s": rov_speed_mm_s,
@@ -1256,7 +1269,10 @@ def simulate_pressure(s: Scenario, t_stop_s: float | None = None
         "max_passes": float(region_passes.max()) if region_passes.size else 0.0,
         "median_pressure_bar": float(np.median(region_pressure[region_pressure > 0]))
                               if (region_pressure > 0).any() else 0.0,
-        "missed_pct": float((region == 0).mean() * 100.0) if region.size else 0.0,
+        # Area partition (sums to 100%): untouched = effectively unstruck;
+        # partial = struck but failed the pressure or min-passes gate.
+        "missed_pct": missed_pct,
+        "partial_pct": partial_pct,
         "region_area_mm2": float(region.size * cell * cell),
         "total_time_s": total_time_full,
         "arc_per_step_mm": float(arc_per_step),
@@ -1804,13 +1820,24 @@ def render_result(s: Scenario, strip: np.ndarray, m: dict,
             "pressure, shorten the standoff, or widen the nozzle exit to "
             "deliver more pressure to the hull.")
 
-    c1, c2, c3 = container.columns(3)
+    # The area splits three ways and sums to ~100%: cleaned (gate met),
+    # partial (struck but under-gated), untouched (never struck).
+    c1, c2, c3, c4 = container.columns(4)
     c1.metric(f"{label}Cleaned area", f"{m.get('cleaned_pct', 0):.1f} %",
               help=f"Cells that clear the impact-pressure gate AND get "
                    f"≥ {s.min_passes} passes. The headline cleaning KPI.")
-    c2.metric(f"{label}Median passes", f"{m.get('median_passes', 0):.1f}",
+    c2.metric(f"{label}Partial", f"{m.get('partial_pct', 0):.1f} %",
+              help="Struck at least once but NOT cleaned — either the "
+                   "delivered pressure was below the removal gate (footprint "
+                   f"edges) or it got fewer than {s.min_passes} passes.")
+    c3.metric(f"{label}Untouched", f"{m['missed_pct']:.1f} %",
+              help="Cells never struck by any nozzle (zero passes).")
+    c4.metric(f"{label}Median passes", f"{m.get('median_passes', 0):.1f}",
               help="Typical number of nozzle passes per cell over the region.")
-    c3.metric(f"{label}Untouched", f"{m['missed_pct']:.2f} %")
+    _tot = m.get('cleaned_pct', 0) + m.get('partial_pct', 0) + m['missed_pct']
+    container.caption(
+        f"Cleaned + Partial + Untouched = {_tot:.0f}% of the steady-state "
+        "core (the three are mutually exclusive and cover the area).")
 
     mode = "steady-state core" if s.steady_state_only else "full strip"
     container.caption(
