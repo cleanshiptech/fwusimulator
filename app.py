@@ -54,9 +54,9 @@ st.set_page_config(
 st.title("FWU Coverage Simulator")
 st.caption(
     "Simulates hull cleaning coverage from the rotating jet array. Cleaning "
-    "is decided by jet pressure **delivered at the hull** (intensity gate) "
-    "plus the number of **passes** (dose). Adjust geometry, rotation, "
-    "pressure and traverse speed, then run."
+    "is decided by the jet **impact pressure at the hull** (in bar — how hard "
+    "it hits) plus the number of **passes** (how many times each spot is "
+    "struck). Adjust geometry, rotation, pressure and traverse speed, then run."
 )
 
 KNOTS_TO_MPS = 0.514444
@@ -283,16 +283,23 @@ def scenario_controls(prefix: str, defaults: Scenario, container) -> Scenario:
             f"Footprint diameter on hull: **{s.footprint_dia():.1f} mm** "
             f"(= {s.nozzle_exit_mm:.1f} mm exit + 2 × {_spread_mm:.1f} mm "
             f"spread over {s.standoff_mm} mm standoff)")
-        if s.footprint_dia() < s.cell_size_mm:
-            container.warning(
-                f"Footprint ({s.footprint_dia():.1f} mm) is below the "
-                f"{s.cell_size_mm:g} mm hull-grid resolution, so the impact "
-                "sim deposits onto a single cell. The sensitivity chart "
-                "above still reflects the true sub-mm footprint; lower the "
-                "grid resolution, or raise the spread angle / standoff, to "
-                "resolve it on the grid.")
     else:
         container.caption(f"Footprint diameter on hull: **{s.footprint_dia():.1f} mm**")
+
+    # Mode-independent resolution check: the footprint must span enough cells
+    # to be represented as a disk (and to resolve the delivered-pressure
+    # gradient). Below ~2 cells it collapses toward a single pixel and the
+    # spatial KPIs (cleaned area, pressure contour) get unreliable.
+    _fp_cells = s.footprint_dia() / s.cell_size_mm
+    if _fp_cells < 2.0:
+        container.warning(
+            f"⚠ Footprint ({s.footprint_dia():.1f} mm) spans only "
+            f"{_fp_cells:.1f} grid cells at {s.cell_size_mm:g} mm resolution, "
+            "so it can't be resolved as a disk — the heatmaps and cleaned-area "
+            "KPI will be unreliable (the footprint collapses toward a single "
+            "cell). **Lower the hull grid resolution** (above) to at least "
+            f"~{s.footprint_dia() / 3:.0f} mm, or widen the footprint "
+            "(standoff / spread / exit).")
     s.pressure_profile = container.radio(
         "Pressure distribution within footprint",
         ["Uniform", "Gaussian (peak at centre)"],
@@ -302,9 +309,9 @@ def scenario_controls(prefix: str, defaults: Scenario, container) -> Scenario:
 
     container.subheader("Cleaning criterion")
     container.caption(
-        "Cleaning needs enough **intensity** (jet pressure delivered at the "
-        "hull) AND enough **dose** (passes). Intensity is the gate: below it, "
-        "no amount of dwell removes fouling.")
+        "Cleaning needs enough **impact pressure** (bar delivered at the "
+        "hull) AND enough **passes**. Impact pressure is the gate: below it, "
+        "no number of passes removes fouling.")
     _foul_presets = {
         "Soft biofilm / slime": 15.0,
         "Light weed / early growth": 60.0,
@@ -345,11 +352,11 @@ def scenario_controls(prefix: str, defaults: Scenario, container) -> Scenario:
         "Hull strip length to simulate (mm)", 500, 10000, s.sim_length_mm, step=100,
         key=k("sim_length_mm"))
     s.clean_threshold = container.slider(
-        "Exposure-dose threshold (bar·s, diagnostic)",
+        "Exposure colour scale (bar·s, diagnostic)",
         0.05, 50.0, float(s.clean_threshold), step=0.05,
         key=k("clean_threshold"),
-        help="Diagnostic only: sets the green level on the 'exposure dose' "
-             "heatmap inside the Advanced expander. It does NOT affect the "
+        help="Diagnostic only: sets the green level on the bar·s exposure "
+             "map inside the Advanced expander. It does NOT affect the "
              "Cleaned-area KPI, which uses the intensity gate + passes "
              "criterion above.")
     s.steady_state_only = container.checkbox(
@@ -1724,29 +1731,32 @@ def render_result(s: Scenario, strip: np.ndarray, m: dict,
                   label: str = "") -> None:
     cy0, cy1, cx0, cx1 = core_box
 
-    c1, c2, c3, c4 = container.columns(4)
-    c1.metric(f"{label}Cleaned area", f"{m.get('cleaned_pct', 0):.1f} %",
-              help=f"Cells that clear the intensity gate AND get "
-                   f"≥ {s.min_passes} passes. The headline cleaning KPI.")
-    c2.metric(f"{label}Delivered pressure",
-              f"{m.get('stagnation_pressure_bar', 0):.0f} bar",
-              delta="clears gate" if m.get("intensity_ok") else "below gate",
-              delta_color="normal" if m.get("intensity_ok") else "inverse",
-              help=f"Jet stagnation pressure at the hull vs the "
-                   f"{s.removal_pressure_bar:.0f} bar removal threshold. "
-                   "If below, nothing cleans regardless of passes.")
-    c3.metric(f"{label}Median passes", f"{m.get('median_passes', 0):.1f}",
-              help="Typical number of nozzle passes per cell over the region.")
-    c4.metric(f"{label}Untouched", f"{m['missed_pct']:.2f} %")
-
-    if not m.get("intensity_ok"):
+    # Impact pressure gets its OWN box (units: bar, instantaneous force) so it
+    # is never read as comparable to the bar·s exposure maps below.
+    _pstag = m.get("stagnation_pressure_bar", 0)
+    if m.get("intensity_ok"):
+        container.success(
+            f"**{label}Impact pressure: {_pstag:.0f} bar** delivered at the "
+            f"hull — clears the {s.removal_pressure_bar:.0f} bar removal gate "
+            f"for this fouling. (From {s.pressure_bar} bar at the nozzle, "
+            f"decayed over {s.standoff_mm} mm standoff with a "
+            f"{s.nozzle_exit_mm:.1f} mm exit.) This is how *hard* the jet "
+            "hits — distinct from the bar·s exposure maps below.")
+    else:
         container.error(
-            f"Intensity gate NOT met: the jet delivers only "
-            f"{m.get('stagnation_pressure_bar', 0):.0f} bar at the hull, "
-            f"below the {s.removal_pressure_bar:.0f} bar needed to lift this "
-            "fouling — so cleaned area is 0% no matter how many passes. "
-            "Raise nozzle pressure, shorten the standoff, or widen the "
-            "nozzle exit to deliver more pressure to the hull.")
+            f"**{label}Impact pressure: {_pstag:.0f} bar** delivered at the "
+            f"hull — BELOW the {s.removal_pressure_bar:.0f} bar removal gate, "
+            "so cleaned area is 0% no matter how many passes. Raise nozzle "
+            "pressure, shorten the standoff, or widen the nozzle exit to "
+            "deliver more pressure to the hull.")
+
+    c1, c2, c3 = container.columns(3)
+    c1.metric(f"{label}Cleaned area", f"{m.get('cleaned_pct', 0):.1f} %",
+              help=f"Cells that clear the impact-pressure gate AND get "
+                   f"≥ {s.min_passes} passes. The headline cleaning KPI.")
+    c2.metric(f"{label}Median passes", f"{m.get('median_passes', 0):.1f}",
+              help="Typical number of nozzle passes per cell over the region.")
+    c3.metric(f"{label}Untouched", f"{m['missed_pct']:.2f} %")
 
     mode = "steady-state core" if s.steady_state_only else "full strip"
     container.caption(
@@ -1771,95 +1781,127 @@ def render_result(s: Scenario, strip: np.ndarray, m: dict,
     array_span_x = m["array_span_x_mm"]
     cell = s.cell_size_mm
 
-    # ---- PRIMARY heatmap: jet pressure delivered at the hull (bar) --------
-    # Each cell coloured by the peak stagnation pressure delivered there. The
-    # removal threshold is drawn as a contour, so you can see directly which
-    # parts of the hull were exposed to >= the cleaning pressure — the
-    # spatial, per-cell version of the intensity gate.
-    pmap_full = m.get("pressure_strip")
-    if pmap_full is not None:
-        if s.steady_state_only:
-            pmap = pmap_full[cy0:cy1, cx0:cx1]
-            pmap_y = (cy1 - cy0) * cell
-        else:
-            pmap = pmap_full
-            pmap_y = pmap_full.shape[0] * cell
-        ext = [-array_span_x / 2, array_span_x / 2, pmap_y, 0]
-        figp, axp = plt.subplots(figsize=(8, 3.6))
-        pvmax = max(float(pmap.max()), s.removal_pressure_bar * 1.5, 1e-6)
-        imp = axp.imshow(pmap, extent=ext, aspect="auto", cmap="inferno",
-                         vmin=0, vmax=pvmax)
-        # Threshold contour: boundary between cleaned-pressure and below.
-        if pmap.max() >= s.removal_pressure_bar > pmap.min():
-            axp.contour(
-                pmap, levels=[s.removal_pressure_bar],
-                extent=[ext[0], ext[1], ext[3], ext[2]],
-                colors="#39ff14", linewidths=1.2)
-        axp.set_xlabel("Across-track (mm)")
-        axp.set_ylabel("Along-track (mm)")
-        axp.set_title(
-            f"{label}Delivered pressure at hull (bar) — green contour = "
-            f"{s.removal_pressure_bar:.0f} bar removal threshold")
-        plt.colorbar(imp, ax=axp, label="bar delivered")
-        container.pyplot(figp, clear_figure=True)
-        container.caption(
-            "Inside the green contour the jet delivers enough pressure to "
-            "lift the fouling; outside it, no amount of dwell cleans. The "
-            f"**Cleaned area ({m.get('cleaned_pct', 0):.1f}%)** is the part of "
-            f"this region that is *also* struck ≥ {s.min_passes} times.")
+    # ---- PRIMARY: two side-by-side maps — # passes and accumulated exposure
+    # Two distinct, structure-preserving fields:
+    #   passes              = pure geometric coverage (disc overlap, gaps),
+    #   accumulated exposure= bar·s = pressure × dwell summed over passes.
+    # NOTE on units: this is NOT comparable to the "delivered pressure" KPI.
+    # Delivered pressure is in bar (instantaneous force); accumulated exposure
+    # is in bar·s (force × time). The same 18 bar jet only dwells ~0.5 ms per
+    # pass, so it accumulates well under 1 bar·s — different dimension, not a
+    # smaller version of the same number.
+    extent = [-array_span_x / 2, array_span_x / 2, strip.shape[0] * cell, 0]
+    passes_full = m.get("passes_strip")
 
-    # ---- Exposure dose (bar·s) — diagnostic only, demoted into an expander.
-    # The cleaning verdict is the gated Cleaned-area KPI above; bar·s is a
-    # secondary lens on how exposure is distributed, not a clean/not-clean
-    # decision (it ignores the intensity threshold). Kept collapsed so it
-    # doesn't compete with the headline metrics.
-    with container.expander(
-            "Advanced: exposure dose (bar·s) — diagnostic, not the verdict"):
-        st.caption(
-            "Integrated jet-pressure exposure per cell. This is a **dose** "
-            "diagnostic for spotting thin tracks and overlap quality — it "
-            "does **not** decide cleaning (that is the gated Cleaned-area "
-            "KPI above, which also requires the jet to clear the intensity "
-            "threshold). A high bar·s below the intensity gate still cleans "
-            "nothing.")
-        vmax = vmax_shared if vmax_shared is not None else max(strip.max(), 1e-6)
-        extent = [-array_span_x / 2, array_span_x / 2, strip.shape[0] * cell, 0]
-        fig, ax = plt.subplots(figsize=(8, 3.6))
+    def _draw_core_overlay(ax):
+        if not s.steady_state_only:
+            return
+        core_y0_mm = cy0 * cell
+        core_y1_mm = cy1 * cell
+        ax.add_patch(mpatches.Rectangle(
+            (extent[0], 0), extent[1] - extent[0], core_y0_mm,
+            facecolor="white", alpha=0.45, edgecolor="none"))
+        ax.add_patch(mpatches.Rectangle(
+            (extent[0], core_y1_mm), extent[1] - extent[0],
+            strip.shape[0] * cell - core_y1_mm,
+            facecolor="white", alpha=0.45, edgecolor="none"))
+        ax.axhline(core_y0_mm, color="red", lw=0.8, ls="--")
+        ax.axhline(core_y1_mm, color="red", lw=0.8, ls="--")
+
+    hm_l, hm_r = container.columns(2)
+
+    # Left: # passes per cell.
+    with hm_l:
+        if passes_full is not None:
+            pvmax = max(float(np.percentile(
+                passes_full[passes_full > 0], 99))
+                if (passes_full > 0).any() else 1.0, 1.0)
+            fign, axn = plt.subplots(figsize=(5.2, 3.6))
+            imn = axn.imshow(passes_full, extent=extent, aspect="auto",
+                             cmap="magma", vmin=0, vmax=pvmax)
+            _draw_core_overlay(axn)
+            axn.set_xlabel("Across-track (mm)")
+            axn.set_ylabel("Along-track (mm)")
+            axn.set_title(f"{label}Passes per cell")
+            plt.colorbar(imn, ax=axn, label="# passes")
+            st.pyplot(fign, clear_figure=True)
+            st.caption(
+                "Pure coverage: how many times each cell was struck. The "
+                "bright lattice is the **disc-to-disc overlap** (cells reached "
+                "by more than one disc); dark = gaps / thin coverage.")
+
+    # Right: total cleaning dose (bar·s).
+    with hm_r:
+        vmax = vmax_shared if vmax_shared is not None else max(
+            float(np.percentile(strip[strip > 0], 99))
+            if (strip > 0).any() else 1.0, 1e-6)
+        fig, ax = plt.subplots(figsize=(5.2, 3.6))
         im = ax.imshow(strip, extent=extent, aspect="auto",
                        cmap="viridis", vmin=0, vmax=vmax)
-        if s.steady_state_only:
-            core_y0_mm = cy0 * cell
-            core_y1_mm = cy1 * cell
-            ax.add_patch(mpatches.Rectangle(
-                (extent[0], 0), extent[1] - extent[0], core_y0_mm,
-                facecolor="white", alpha=0.45, edgecolor="none"))
-            ax.add_patch(mpatches.Rectangle(
-                (extent[0], core_y1_mm), extent[1] - extent[0],
-                strip.shape[0] * cell - core_y1_mm,
-                facecolor="white", alpha=0.45, edgecolor="none"))
-            ax.axhline(core_y0_mm, color="red", lw=0.8, ls="--")
-            ax.axhline(core_y1_mm, color="red", lw=0.8, ls="--")
+        _draw_core_overlay(ax)
         ax.set_xlabel("Across-track (mm)")
         ax.set_ylabel("Along-track (mm)")
-        ax.set_title(f"{label}Exposure dose (bar*s per cell)")
-        plt.colorbar(im, ax=ax, label="bar*s")
+        ax.set_title(f"{label}Accumulated exposure (bar·s)")
+        plt.colorbar(im, ax=ax, label="bar·s = pressure × dwell time")
         st.pyplot(fig, clear_figure=True)
+        st.caption(
+            "Pressure **× dwell time**, summed over passes — units of bar·s, "
+            "**not** the same as the delivered-pressure gate (bar). The 18 bar "
+            "jet only dwells ~0.5 ms per pass, so accumulated exposure is < 1 "
+            "bar·s even though each hit is 18 bar. Use this for the *pattern* "
+            "(overlap/gaps weighted by intensity), not as a pressure value.")
 
-        region = strip[cy0:cy1, cx0:cx1] if s.steady_state_only else strip
-        region_extent_y = (cy1 - cy0) * cell if s.steady_state_only \
-            else strip.shape[0] * cell
-        fig_t, ax_t = plt.subplots(figsize=(8, 2.8))
-        ax_t.imshow(
-            (region >= s.clean_threshold).astype(np.float32),
-            extent=[-array_span_x / 2, array_span_x / 2, region_extent_y, 0],
-            aspect="auto", cmap="Greens", vmin=0, vmax=1,
-        )
-        ax_t.set_xlabel("Across-track (mm)")
-        ax_t.set_ylabel("Along-track (mm)")
-        ax_t.set_title(
-            f"{label}Cells above dose threshold "
-            f"(green = >= {s.clean_threshold:.2f} bar*s)")
-        st.pyplot(fig_t, clear_figure=True)
+    # ---- Advanced: delivered-pressure map + binary cleaned map -----------
+    with container.expander("Advanced: delivered-pressure & cleaned maps"):
+        pmap_full = m.get("pressure_strip")
+        if pmap_full is not None:
+            pmap = (pmap_full[cy0:cy1, cx0:cx1] if s.steady_state_only
+                    else pmap_full)
+            pmap_y = ((cy1 - cy0) if s.steady_state_only
+                      else pmap_full.shape[0]) * cell
+            ext = [-array_span_x / 2, array_span_x / 2, pmap_y, 0]
+            figp, axp = plt.subplots(figsize=(8, 3.0))
+            pvmax = max(float(pmap.max()), s.removal_pressure_bar * 1.2, 1e-6)
+            imp = axp.imshow(pmap, extent=ext, aspect="auto", cmap="inferno",
+                             vmin=0, vmax=pvmax)
+            if pmap.max() >= s.removal_pressure_bar > pmap.min():
+                axp.contour(pmap, levels=[s.removal_pressure_bar],
+                            extent=[ext[0], ext[1], ext[3], ext[2]],
+                            colors="#39ff14", linewidths=1.0)
+            axp.set_xlabel("Across-track (mm)")
+            axp.set_ylabel("Along-track (mm)")
+            axp.set_title(
+                f"{label}Delivered pressure (bar) — green = "
+                f"{s.removal_pressure_bar:.0f} bar gate")
+            plt.colorbar(imp, ax=axp, label="bar delivered")
+            st.pyplot(figp, clear_figure=True)
+            st.caption(
+                "Peak pressure delivered per cell. It saturates near the "
+                "rated delivered pressure almost everywhere a cell is "
+                "touched, so it reads flat — use it to check the gate is met "
+                "across the field, not to see ring structure (that's the "
+                "total-dose map above).")
+
+        # Binary cleaned map: pressure gate AND passes gate.
+        pmap2 = m.get("pressure_strip")
+        pass2 = m.get("passes_strip")
+        if pmap2 is not None and pass2 is not None:
+            pr = pmap2[cy0:cy1, cx0:cx1] if s.steady_state_only else pmap2
+            pa = pass2[cy0:cy1, cx0:cx1] if s.steady_state_only else pass2
+            cleaned = ((pr >= s.removal_pressure_bar)
+                       & (pa >= s.min_passes)).astype(np.float32)
+            ry = ((cy1 - cy0) if s.steady_state_only
+                  else pmap2.shape[0]) * cell
+            fig_t, ax_t = plt.subplots(figsize=(8, 2.8))
+            ax_t.imshow(cleaned,
+                        extent=[-array_span_x / 2, array_span_x / 2, ry, 0],
+                        aspect="auto", cmap="Greens", vmin=0, vmax=1)
+            ax_t.set_xlabel("Across-track (mm)")
+            ax_t.set_ylabel("Along-track (mm)")
+            ax_t.set_title(
+                f"{label}Cleaned cells (green = gate met AND "
+                f"≥ {s.min_passes} passes)")
+            st.pyplot(fig_t, clear_figure=True)
 
 
 # -----------------------------------------------------------------------------
@@ -2565,12 +2607,12 @@ else:
         st.subheader("Delta (B − A)")
         keys = [
             ("cleaned_pct", "Cleaned area (%)", "+"),
-            ("stagnation_pressure_bar", "Delivered pressure (bar)", "+"),
+            ("stagnation_pressure_bar", "Impact pressure (bar)", "+"),
             ("median_passes", "Median passes", "+"),
             ("missed_pct", "Untouched (%)", "-"),
-            # Exposure dose (bar·s) — diagnostic, shown last.
-            ("p50_bs", "Median exposure dose (bar·s)", "+"),
-            ("mean_bs", "Mean exposure dose (bar·s)", "+"),
+            # Accumulated exposure (bar·s) — diagnostic, shown last.
+            ("p50_bs", "Median exposure (bar·s)", "+"),
+            ("mean_bs", "Mean exposure (bar·s)", "+"),
         ]
         rows = []
         for key, label, better in keys:
