@@ -717,14 +717,30 @@ def simulate_pressure(s: Scenario, t_stop_s: float | None = None
     ny = int(full_extent / cell)
     grid = np.zeros((ny, nx), dtype=np.float32)
 
+    # Time-step constraints. The integrated exposure is Σ p·dt, which only
+    # tracks the true dwell time if the jet's footprint cannot SKIP past
+    # cells between samples. The binding constraint is the tangential speed
+    # of the nozzle along its impact ring (omega·r), which at high RPM is
+    # far faster than the ROV traverse: the nozzle must not advance more
+    # than half a footprint width per step, or the swept track breaks up
+    # into a dotted line and the per-cell exposure is undercounted.
+    ir = s.impact_radius_mm()
+    fp_d = s.footprint_dia()
+    v_tan = omega_rad_s * max(ir, 1e-6)            # mm/s along the ring
     dt_rot = math.radians(5.0) / max(omega_rad_s, 1e-6)
     dt_trav = 0.5 * cell / max(rov_speed_mm_s, 1e-6)
-    dt = min(dt_rot, dt_trav)
+    dt_arc = 0.5 * max(fp_d, cell) / max(v_tan, 1e-6)  # footprint can't skip
+    dt = min(dt_rot, dt_trav, dt_arc)
     total_time_full = s.sim_length_mm / max(rov_speed_mm_s, 1e-6)
     total_time = total_time_full if t_stop_s is None else min(t_stop_s, total_time_full)
-    n_steps = int(total_time / dt) + 1
-    n_steps = min(n_steps, 12000)
+    n_steps_ideal = int(total_time / dt) + 1
+    # Cap to bound runtime, but record whether the cap forced a coarser dt
+    # than the jet-path constraint wants (i.e. the track is undersampled).
+    STEP_CAP = 60000
+    n_steps = min(n_steps_ideal, STEP_CAP)
     dt = total_time / max(n_steps, 1)
+    arc_per_step = v_tan * dt
+    undersampled = arc_per_step > max(fp_d, cell)
 
     stencil = footprint_stencil(s)
     sh, sw = stencil.shape
@@ -743,7 +759,6 @@ def simulate_pressure(s: Scenario, t_stop_s: float | None = None
     # (1–2 mm) responsive.
     n_discs = len(rotated)
     if not (n_discs == 0 or s.n_nozzles == 0 or n_steps == 0):
-        ir = s.impact_radius_mm()
         steps = np.arange(n_steps, dtype=np.float64)
         t = steps * dt                                   # (S,)
         array_y = array_y_offset_init + rov_speed_mm_s * t  # (S,)
@@ -841,6 +856,9 @@ def simulate_pressure(s: Scenario, t_stop_s: float | None = None
         "missed_pct": float((region == 0).mean() * 100.0) if region.size else 0.0,
         "region_area_mm2": float(region.size * cell * cell),
         "total_time_s": total_time_full,
+        "arc_per_step_mm": float(arc_per_step),
+        "footprint_mm": float(fp_d),
+        "undersampled": bool(undersampled),
     }
     return strip, metrics, core_box
 
@@ -1374,8 +1392,20 @@ def render_result(s: Scenario, strip: np.ndarray, m: dict,
         f"KPIs over {mode}. Δt = {m['dt_ms']:.2f} ms, {m['n_steps']} steps. "
         f"Array span (yaw {s.yaw_deg:+.0f}°) = "
         f"{m['array_span_x_mm']:.0f} mm across × {m['array_span_y_mm']:.0f} mm along. "
-        f"Impact ring r = {s.impact_radius_mm():.1f} mm."
+        f"Impact ring r = {s.impact_radius_mm():.1f} mm. "
+        f"Jet advances {m.get('arc_per_step_mm', 0):.1f} mm/step along its ring "
+        f"(footprint {m.get('footprint_mm', 0):.1f} mm)."
     )
+    if m.get("undersampled"):
+        container.warning(
+            f"Time-step undersampled: the jet advances "
+            f"{m.get('arc_per_step_mm', 0):.1f} mm per step along its impact "
+            f"ring — wider than the {m.get('footprint_mm', 0):.1f} mm "
+            "footprint — so the swept track breaks into a dotted line and "
+            "the per-cell exposure (median/peak) is undercounted. Total "
+            "deposited energy is still conserved. Lower the RPM or the "
+            "simulated strip length so the step budget can resolve the "
+            "path, or accept that point KPIs read low here.")
 
     vmax = vmax_shared if vmax_shared is not None else max(strip.max(), 1e-6)
     array_span_x = m["array_span_x_mm"]

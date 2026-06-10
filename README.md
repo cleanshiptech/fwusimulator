@@ -125,6 +125,21 @@ binned hit-count grid with the stencil (`numpy.fft`). Runtime is therefore
 independent of footprint size and timestep count, keeping 1–2 mm grids
 responsive even with a large footprint.
 
+**Time integration & dwell.** Exposure is `Σ pressure · Δt` per cell, i.e.
+jet pressure integrated over the time the footprint dwells on that cell.
+The dominant motion is the nozzle tip sweeping its impact ring at
+`ω · r_impact` — at high RPM this is ~10–15 m/s, far faster than the ROV
+traverse. The time step is bounded so the footprint advances at most half
+its own width per step along that ring (`Δt ≤ 0.5 · footprint / (ω·r)`);
+otherwise the jet would *skip* cells between samples, breaking the swept
+track into a dotted line and undercounting per-cell exposure. The KPI
+caption reports the per-step arc length, and a warning fires if the step
+budget still can't resolve the path. Note: total deposited energy
+(`mean bar·s`) is conserved regardless of step size — only the *spatial*
+distribution (median/peak per cell, coverage) depends on resolving the
+path. A fast, small, high-pressure jet legitimately deposits low bar·s on
+any single spot: it cleans a thin kerf along the ring, not a filled area.
+
 The Hull-tab model ignores bow, stern, superstructure, and appendages;
 total wetted area is therefore a lower bound. Real-world cleaning time
 also includes docking/positioning overhead, overlap, and transit between
