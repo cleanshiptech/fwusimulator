@@ -386,7 +386,7 @@ def scenario_controls(prefix: str, defaults: Scenario, container) -> Scenario:
     _gate = "✅ above" if _pstag >= s.removal_pressure_bar else "❌ BELOW"
     container.caption(
         f"Jet delivers **{_pstag:.0f} bar** at the hull "
-        f"({s.pressure_bar} bar at nozzle, decayed over "
+        f"({s.pressure_bar:.0f} bar at nozzle, decayed over "
         f"{s.standoff_mm} mm standoff with {s.nozzle_exit_mm:.1f} mm exit) "
         f"— {_gate} the {s.removal_pressure_bar:.0f} bar removal threshold.")
     s.min_passes = container.slider(
@@ -1792,7 +1792,7 @@ def render_result(s: Scenario, strip: np.ndarray, m: dict,
         container.success(
             f"**{label}Impact pressure: {_pstag:.0f} bar** delivered at the "
             f"hull — clears the {s.removal_pressure_bar:.0f} bar removal gate "
-            f"for this fouling. (From {s.pressure_bar} bar at the nozzle, "
+            f"for this fouling. (From {s.pressure_bar:.0f} bar at the nozzle, "
             f"decayed over {s.standoff_mm} mm standoff with a "
             f"{s.nozzle_exit_mm:.1f} mm exit.) This is how *hard* the jet "
             "hits — distinct from the bar·s exposure maps below.")
@@ -2629,13 +2629,17 @@ if not compare_mode:
 else:
     with st.sidebar:
         st.divider()
-        st.caption("Configure both scenarios below, then click Run.")
+        st.caption(
+            "Both scenarios start from the SAME defaults — change one thing "
+            "in B to isolate its effect, then click Run.")
     col_a_ctrl, col_b_ctrl = st.sidebar.columns(2)
     with col_a_ctrl.expander("Scenario A", expanded=True):
         scen_a = scenario_controls("A", Scenario(), col_a_ctrl)
-    default_b = Scenario(rov_speed_kn=1.0, rpm=800, total_flow_lpm=350.0)
+    # B starts identical to A so a single changed parameter is a clean
+    # one-variable comparison (e.g. 3 vs 4 nozzles at the same pump flow —
+    # otherwise a differing flow masks the derived-pressure effect).
     with col_b_ctrl.expander("Scenario B", expanded=True):
-        scen_b = scenario_controls("B", default_b, col_b_ctrl)
+        scen_b = scenario_controls("B", Scenario(), col_b_ctrl)
 
     top_a, top_b = st.columns(2)
     with top_a:
