@@ -30,8 +30,17 @@ Operating point
   nozzle exit diameter (mm)
 
 Footprint model
-- Footprint diameter on hull: linear with pressure (60→80 mm) or manual
+- Footprint diameter on hull, three modes:
+  - **Physical jet (default)** — the impact zone is set by the spreading
+    free jet: `d_fp = nozzle_exit_dia + 2·standoff·tan(spread_half_angle)`.
+    Both the **nozzle exit diameter** and the **distance to the hull
+    (standoff)** drive the footprint, with a tunable jet spread half-angle.
+  - Linear with pressure (60→80 mm) — legacy curve, pressure only.
+  - Manual override — fixed diameter.
 - Pressure distribution within footprint: uniform or Gaussian
+- Hull grid resolution: 10 / 5 / 2 / 1 mm per cell (default 5 mm). Finer
+  grids resolve the small (mm-scale) physical footprint; the deposit step
+  is FFT-convolution-based, so cost is independent of footprint size.
 
 Hull strip
 - Strip length to simulate (mm), cleaning threshold (bar·s)
@@ -39,7 +48,11 @@ Hull strip
 ## Outputs
 
 - Live top-down schematic of the disc array and nozzle impact rings
-- Side cross-section showing nozzle standoff and cant
+- Side cross-section drawing the spreading jet cone from the nozzle exit
+  diameter down to the hull footprint
+- **Impact zone vs nozzle exit & standoff** chart (physical-jet mode):
+  footprint diameter vs standoff for several exit diameters, plus the
+  relative cleaning-energy density (∝ 1/footprint area)
 - Heatmap of bar·s exposure per cell across the hull strip
 - Binary "cleaned" map for cells exceeding the threshold
 - Histogram of exposure values
@@ -96,6 +109,21 @@ pressure decay along the jet axis, hull curvature, biofouling resistance,
 or ROV pitch/roll. The cant correction shifts the impingement ring inward
 by `standoff · tan(cant)`. The Gaussian footprint option uses 2σ at the
 stated footprint diameter.
+
+**Physical-jet footprint.** In the default footprint mode the impact-zone
+diameter is `nozzle_exit_dia + 2·standoff·tan(spread_half_angle)`, so a
+larger standoff or a wider nozzle exit grows the footprint, and the
+deposited cleaning energy is diluted over `π·(d_fp/2)²`. A high-pressure
+jet with a small exit at short standoff produces a tight, mm-scale
+footprint that cleans a narrow kerf rather than an area — set the **hull
+grid resolution** to 1–2 mm to resolve it (the coarse 10 mm grid collapses
+a sub-cm footprint onto a single cell and reports ~0 % coverage).
+
+**Performance.** Every nozzle hit deposits the same weighted footprint
+stencil, so the per-cell exposure is computed as the 2-D convolution of a
+binned hit-count grid with the stencil (`numpy.fft`). Runtime is therefore
+independent of footprint size and timestep count, keeping 1–2 mm grids
+responsive even with a large footprint.
 
 The Hull-tab model ignores bow, stern, superstructure, and appendages;
 total wetted area is therefore a lower bound. Real-world cleaning time
