@@ -11,9 +11,34 @@ its instantaneous jet pressure (bar) onto the cells inside its footprint,
 weighted by the simulation time-step. The accumulated quantity per cell is
 **integrated pressure exposure** in **bar·seconds (bar·s)**.
 
-This is a useful proxy for cleaning energy: a cell needs enough jet
-pressure for long enough to lift coating-grade biofilm. Calibrate the
-"clean threshold" (bar·s) against a known field-cleaning trial.
+The accumulated bar·s is a **dose** proxy, shown in the secondary heatmap.
+
+## Evaluating cleaning effectiveness (intensity gate + dose)
+
+Raw bar·s alone is a poor measure of cleaning power because it trades
+pressure against time linearly — it says "10 bar for 1 s" equals "200 bar
+for 0.05 s", which is physically wrong: below a fouling-specific intensity
+threshold you remove nothing no matter how long you dwell. The headline
+**Cleaned area** KPI therefore uses a two-part criterion:
+
+1. **Intensity gate.** The jet's **stagnation pressure delivered at the
+   hull** must exceed a removal threshold for the fouling type. A submerged
+   free jet holds its nozzle pressure within a potential core (length ≈
+   6 × exit diameter), then its centreline pressure decays as
+   `(core_len / standoff)²`. So delivered pressure — *not* nozzle pressure —
+   is what cleans, and **standoff** and **nozzle exit diameter** are the
+   dominant levers (e.g. 100 bar at the nozzle through a 1.3 mm exit at
+   18 mm standoff delivers only ~19 bar at the hull; shorten the standoff to
+   8 mm and it delivers ~95 bar). Below the gate, cleaned area is 0 %.
+2. **Dose gate.** Among cells that clear the intensity gate, a cell counts
+   as cleaned once it receives at least the **minimum number of passes**.
+
+**How to compare configurations.** Calibrate the removal threshold to a run
+you *know* cleans your fouling (the sidebar shows the delivered pressure of
+the current jet live — set the threshold to that). Then change a parameter:
+if delivered pressure stays above the gate and cleaned-area rises, that
+change cleans *more*. Fouling presets (soft biofilm / light weed / hard
+calcareous) seed typical removal thresholds.
 
 ## Parameters
 

@@ -100,11 +100,36 @@ class Scenario:
 
     # Hull strip & threshold
     sim_length_mm: int = 2000
-    clean_threshold: float = 5.0    # bar·s — calibrate against field trials
+    clean_threshold: float = 0.5    # bar·s — dose heatmap threshold only
     cell_size_mm: float = 5.0       # hull-grid resolution
+
+    # Cleaning criterion: an intensity GATE (jet stagnation pressure at the
+    # hull must exceed a removal threshold for the fouling type) plus a DOSE
+    # gate (a minimum number of nozzle passes over the cell).
+    removal_pressure_bar: float = 30.0   # P_stag at hull needed to lift fouling
+    min_passes: int = 2                  # passes required once above the gate
+    jet_core_factor: float = 6.0         # potential-core length = factor · exit_dia
 
     # Post-processing
     steady_state_only: bool = True
+
+    def stagnation_pressure_bar(self) -> float:
+        """
+        Jet stagnation pressure delivered at the hull. A submerged free jet
+        holds its nozzle pressure within the potential core (length ≈
+        core_factor · exit_dia), then its centreline dynamic pressure decays
+        as (core_len / standoff)² beyond it. This is the physical 'cleaning
+        intensity' — what actually lifts fouling — and it is what makes
+        standoff and exit diameter the dominant power levers.
+        """
+        d0 = max(self.nozzle_exit_mm, 1e-6)
+        core_len = self.jet_core_factor * d0
+        # Jet path length to the hull (standoff along the canted axis).
+        L = self.standoff_mm / max(math.cos(math.radians(self.nozzle_cant_deg)),
+                                   1e-6)
+        if L <= core_len:
+            return float(self.pressure_bar)
+        return float(self.pressure_bar) * (core_len / L) ** 2
 
     def footprint_dia(self) -> float:
         if self.footprint_mode == "Manual override":
@@ -140,7 +165,8 @@ def scenario_key(s: Scenario) -> tuple:
 def scenario_full_key(s: Scenario) -> tuple:
     """Full hashable key — all params that affect simulation output."""
     return (*scenario_key(s), s.rpm, s.rov_speed_kn, s.pressure_profile,
-            s.sim_length_mm, s.clean_threshold, s.steady_state_only)
+            s.sim_length_mm, s.clean_threshold, s.steady_state_only,
+            s.removal_pressure_bar, s.min_passes, s.jet_core_factor)
 
 
 # -----------------------------------------------------------------------------
@@ -272,20 +298,56 @@ def scenario_controls(prefix: str, defaults: Scenario, container) -> Scenario:
         key=k("pressure_profile"),
     )
 
+    container.subheader("Cleaning criterion")
+    container.caption(
+        "Cleaning needs enough **intensity** (jet pressure delivered at the "
+        "hull) AND enough **dose** (passes). Intensity is the gate: below it, "
+        "no amount of dwell removes fouling.")
+    _foul_presets = {
+        "Soft biofilm / slime": 20.0,
+        "Light weed / early growth": 60.0,
+        "Hard calcareous / barnacle": 150.0,
+        "Custom": None,
+    }
+    _foul_choice = container.selectbox(
+        "Fouling type (sets removal pressure)",
+        list(_foul_presets.keys()),
+        index=0,
+        key=k("foul_preset"),
+        help="Minimum jet stagnation pressure at the hull needed to lift "
+             "this fouling. Calibrate against a known field result — set it "
+             "to the delivered pressure of a run you KNOW cleans your "
+             "fouling (shown live below).")
+    if _foul_presets[_foul_choice] is not None:
+        s.removal_pressure_bar = _foul_presets[_foul_choice]
+    else:
+        s.removal_pressure_bar = container.slider(
+            "Removal pressure at hull (bar)", 1.0, 400.0,
+            float(s.removal_pressure_bar), step=1.0,
+            key=k("removal_pressure_bar"))
+    # Live readout of delivered (stagnation) pressure for the current jet.
+    _pstag = s.stagnation_pressure_bar()
+    _gate = "✅ above" if _pstag >= s.removal_pressure_bar else "❌ BELOW"
+    container.caption(
+        f"Jet delivers **{_pstag:.0f} bar** at the hull "
+        f"({s.pressure_bar} bar at nozzle, decayed over "
+        f"{s.standoff_mm} mm standoff with {s.nozzle_exit_mm:.1f} mm exit) "
+        f"— {_gate} the {s.removal_pressure_bar:.0f} bar removal threshold.")
+    s.min_passes = container.slider(
+        "Minimum passes to clean", 1, 10, int(s.min_passes), key=k("min_passes"),
+        help="Once the intensity gate is cleared, a cell must be struck at "
+             "least this many times to count as cleaned.")
+
     container.subheader("Hull strip & KPIs")
     s.sim_length_mm = container.slider(
         "Hull strip length to simulate (mm)", 500, 10000, s.sim_length_mm, step=100,
         key=k("sim_length_mm"))
     s.clean_threshold = container.slider(
-        "Cleaning threshold (bar*s)", 0.5, 200.0, float(s.clean_threshold), step=0.5,
+        "Dose heatmap threshold (bar*s)", 0.05, 50.0, float(s.clean_threshold), step=0.05,
         key=k("clean_threshold"),
-        help="A cell counts as 'cleaned' when its integrated pressure "
-             "exposure exceeds this value. Calibrate against a field "
-             "trial — a good starting point for light biofilm at "
-             "200–300 bar is around 3–8 bar·s. Values above ~20 bar·s "
-             "will make most cells register as uncleaned at realistic "
-             "traverse speeds, collapsing the coverage KPI to 0% and "
-             "the Hull-tab cleaning rate to zero.")
+        help="Only affects the secondary bar·s 'dose' heatmap, not the "
+             "cleaned-area KPI (which uses the intensity+passes criterion "
+             "above). Lower this to match the now-smaller bar·s values.")
     s.steady_state_only = container.checkbox(
         "Report KPIs on steady-state core only",
         value=s.steady_state_only,
@@ -907,6 +969,7 @@ def simulate_pressure(s: Scenario, t_stop_s: float | None = None
     nx = int(width_extent / cell)
     ny = int(full_extent / cell)
     grid = np.zeros((ny, nx), dtype=np.float32)
+    passes = np.zeros((ny, nx), dtype=np.float32)  # nozzle passes per cell
 
     # Time-step constraints. The integrated exposure is Σ p·dt, which only
     # tracks the true dwell time if the jet's footprint cannot SKIP past
@@ -995,11 +1058,19 @@ def simulate_pressure(s: Scenario, t_stop_s: float | None = None
         hit = np.bincount((piy[keep] * pnx + pix[keep]),
                           minlength=pny * pnx).astype(np.float32).reshape(pny, pnx)
 
+        # Binary footprint (presence): convolving the hit grid with it counts
+        # how many nozzle PASSES covered each cell — the dose for the cleaning
+        # criterion, distinct from the energy (bar·s) deposit above.
+        binary_stencil = (stencil > 0.0).astype(np.float32)
+
         if sh == 1 and sw == 1:
             # Single-cell footprint (sub-resolution jet): no spread to apply.
-            grid += hit[rr:rr + ny, rr:rr + nx] * weighted_stencil[0, 0]
+            hcore = hit[rr:rr + ny, rr:rr + nx]
+            grid += hcore * weighted_stencil[0, 0]
+            passes += hcore * binary_stencil[0, 0]
         else:
-            # FFT convolution: O(MN log MN), stencil-size independent.
+            # FFT convolution: O(MN log MN), stencil-size independent. The
+            # hit grid's FFT is shared by the energy and pass-count deposits.
             fy = pny + sh - 1
             fx = pnx + sw - 1
             H = np.fft.rfft2(hit, s=(fy, fx))
@@ -1010,12 +1081,17 @@ def simulate_pressure(s: Scenario, t_stop_s: float | None = None
             # conv[piy+dy, pix+dx]. The real grid cell (i, j) corresponds to
             # padded (i+rr, j+rr), so it reads conv[i+2*rr, j+2*rr].
             grid += conv[2 * rr:2 * rr + ny, 2 * rr:2 * rr + nx].astype(np.float32)
+            Kb = np.fft.rfft2(binary_stencil, s=(fy, fx))
+            convb = np.fft.irfft2(H * Kb, s=(fy, fx))
+            passes += convb[2 * rr:2 * rr + ny,
+                            2 * rr:2 * rr + nx].astype(np.float32)
 
     y_strip_start = 0
     y_strip_end = int((s.sim_length_mm + array_span_y) / cell)
     x_strip_start = int(margin_mm / cell)
     x_strip_end = int((margin_mm + array_span_x) / cell)
     strip = grid[y_strip_start:y_strip_end, x_strip_start:x_strip_end]
+    passes_strip = passes[y_strip_start:y_strip_end, x_strip_start:x_strip_end]
 
     core_y0 = int(array_span_y / cell)
     core_y1 = int(s.sim_length_mm / cell)
@@ -1027,8 +1103,23 @@ def simulate_pressure(s: Scenario, t_stop_s: float | None = None
 
     if s.steady_state_only:
         region = strip[core_y0:core_y1, core_x0:core_x1]
+        region_passes = passes_strip[core_y0:core_y1, core_x0:core_x1]
     else:
         region = strip
+        region_passes = passes_strip
+
+    # --- Cleaning criterion: intensity gate × dose gate -------------------
+    # Intensity: the jet must deliver enough stagnation pressure at the hull
+    # to lift the fouling. This is per-scenario (same jet everywhere), so it
+    # gates the WHOLE field on or off. Dose: a cell also needs a minimum
+    # number of passes. A cell is cleaned iff both hold.
+    p_stag = s.stagnation_pressure_bar()
+    intensity_ok = p_stag >= s.removal_pressure_bar
+    if region_passes.size and intensity_ok:
+        cleaned_mask = region_passes >= s.min_passes
+        cleaned_pct = float(cleaned_mask.mean() * 100.0)
+    else:
+        cleaned_pct = 0.0
 
     metrics = {
         "rov_speed_mm_s": rov_speed_mm_s,
@@ -1042,8 +1133,15 @@ def simulate_pressure(s: Scenario, t_stop_s: float | None = None
         "p90_bs": float(np.percentile(region, 90)) if region.size else 0.0,
         "min_bs": float(region.min()) if region.size else 0.0,
         "max_bs": float(region.max()) if region.size else 0.0,
+        # Legacy bar·s coverage (kept for continuity / the dose heatmap).
         "coverage_pct": float((region >= s.clean_threshold).mean() * 100.0)
                        if region.size else 0.0,
+        # New physically-gated cleaning coverage.
+        "cleaned_pct": cleaned_pct,
+        "stagnation_pressure_bar": float(p_stag),
+        "intensity_ok": bool(intensity_ok),
+        "median_passes": float(np.median(region_passes)) if region_passes.size else 0.0,
+        "max_passes": float(region_passes.max()) if region_passes.size else 0.0,
         "missed_pct": float((region == 0).mean() * 100.0) if region.size else 0.0,
         "region_area_mm2": float(region.size * cell * cell),
         "total_time_s": total_time_full,
@@ -1571,12 +1669,28 @@ def render_result(s: Scenario, strip: np.ndarray, m: dict,
     cy0, cy1, cx0, cx1 = core_box
 
     c1, c2, c3, c4 = container.columns(4)
-    c1.metric(f"{label}Cleaned area", f"{m['coverage_pct']:.1f} %",
-              help=f"Cells with exposure >= {s.clean_threshold:.1f} bar*s")
-    c2.metric(f"{label}Median exposure", f"{m['p50_bs']:.1f} bar*s")
-    c3.metric(f"{label}10th percentile", f"{m['p10_bs']:.1f} bar*s",
-              help="The worst-cleaned 10% of cells receive at least this much.")
+    c1.metric(f"{label}Cleaned area", f"{m.get('cleaned_pct', 0):.1f} %",
+              help=f"Cells that clear the intensity gate AND get "
+                   f"≥ {s.min_passes} passes. The headline cleaning KPI.")
+    c2.metric(f"{label}Delivered pressure",
+              f"{m.get('stagnation_pressure_bar', 0):.0f} bar",
+              delta="clears gate" if m.get("intensity_ok") else "below gate",
+              delta_color="normal" if m.get("intensity_ok") else "inverse",
+              help=f"Jet stagnation pressure at the hull vs the "
+                   f"{s.removal_pressure_bar:.0f} bar removal threshold. "
+                   "If below, nothing cleans regardless of passes.")
+    c3.metric(f"{label}Median passes", f"{m.get('median_passes', 0):.1f}",
+              help="Typical number of nozzle passes per cell over the region.")
     c4.metric(f"{label}Untouched", f"{m['missed_pct']:.2f} %")
+
+    if not m.get("intensity_ok"):
+        container.error(
+            f"Intensity gate NOT met: the jet delivers only "
+            f"{m.get('stagnation_pressure_bar', 0):.0f} bar at the hull, "
+            f"below the {s.removal_pressure_bar:.0f} bar needed to lift this "
+            "fouling — so cleaned area is 0% no matter how many passes. "
+            "Raise nozzle pressure, shorten the standoff, or widen the "
+            "nozzle exit to deliver more pressure to the hull.")
 
     mode = "steady-state core" if s.steady_state_only else "full strip"
     container.caption(
@@ -1741,7 +1855,8 @@ if not compare_mode:
                 "rov_speed_kn": scen.rov_speed_kn,
                 "array_span_x_mm": metrics["array_span_x_mm"],
                 "array_span_y_mm": metrics["array_span_y_mm"],
-                "coverage_pct": metrics["coverage_pct"],
+                # Hull-tab cleaning rate uses the physically-gated cleaned area.
+                "coverage_pct": metrics["cleaned_pct"],
             }
             render_result(scen, strip, metrics, core_box, st)
         else:
