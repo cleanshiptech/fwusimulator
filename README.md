@@ -43,6 +43,14 @@ if delivered pressure stays above the gate and cleaned-area rises, that
 change cleans *more*. Fouling presets (soft biofilm / light weed / hard
 calcareous) seed typical removal thresholds.
 
+**The primary heatmap is the delivered-pressure map** (bar at the hull,
+per cell), with the removal threshold drawn as a contour — so you can see
+exactly which parts of the hull were exposed to enough pressure to clean.
+The pressure is highest at each footprint centre (the jet core) and falls
+toward the edges; the gate is applied per cell, so a cell counts as cleaned
+when it is *inside the contour* AND struck enough times. The bar·s exposure
+map is retained only as a diagnostic in the Advanced expander.
+
 ## Parameters
 
 Array geometry
