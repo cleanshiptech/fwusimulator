@@ -5,13 +5,16 @@ Streamlit tool that simulates how the ROV [[Domains/product/robot|pressure washi
 
 ## What it computes
 
-The hull is split into 1×1 cm cells. As the ROV moves at the chosen
-traverse speed and each disc spins at the chosen RPM, every nozzle deposits
-its instantaneous jet pressure (bar) onto the cells inside its footprint,
-weighted by the simulation time-step. The accumulated quantity per cell is
-**integrated pressure exposure** in **bar·seconds (bar·s)**.
+The hull is split into a grid (default 5 mm cells). As the ROV moves at the
+chosen traverse speed and each disc spins at the chosen RPM, the sim tracks,
+per cell, how many nozzle **passes** it received and how much **integrated
+jet-pressure exposure** (bar·seconds) it accumulated.
 
-The accumulated bar·s is a **dose** proxy, shown in the secondary heatmap.
+The headline **Cleaned area** comes from the intensity-gate + dose criterion
+below. The accumulated bar·s is a **dose diagnostic only** — it lives in a
+collapsed *Advanced: exposure dose* expander and never decides cleaning (a
+high bar·s below the intensity gate still cleans nothing). It is kept for
+inspecting track thinness and overlap quality, not as the verdict.
 
 ## Evaluating cleaning effectiveness (intensity gate + dose)
 

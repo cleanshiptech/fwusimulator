@@ -53,8 +53,10 @@ st.set_page_config(
 
 st.title("FWU Coverage Simulator")
 st.caption(
-    "Simulates integrated jet pressure exposure on the hull (1x1 cm grid). "
-    "Adjust geometry, rotation, pressure and traverse speed, then run."
+    "Simulates hull cleaning coverage from the rotating jet array. Cleaning "
+    "is decided by jet pressure **delivered at the hull** (intensity gate) "
+    "plus the number of **passes** (dose). Adjust geometry, rotation, "
+    "pressure and traverse speed, then run."
 )
 
 KNOTS_TO_MPS = 0.514444
@@ -343,11 +345,13 @@ def scenario_controls(prefix: str, defaults: Scenario, container) -> Scenario:
         "Hull strip length to simulate (mm)", 500, 10000, s.sim_length_mm, step=100,
         key=k("sim_length_mm"))
     s.clean_threshold = container.slider(
-        "Dose heatmap threshold (bar*s)", 0.05, 50.0, float(s.clean_threshold), step=0.05,
+        "Exposure-dose threshold (bar·s, diagnostic)",
+        0.05, 50.0, float(s.clean_threshold), step=0.05,
         key=k("clean_threshold"),
-        help="Only affects the secondary bar·s 'dose' heatmap, not the "
-             "cleaned-area KPI (which uses the intensity+passes criterion "
-             "above). Lower this to match the now-smaller bar·s values.")
+        help="Diagnostic only: sets the green level on the 'exposure dose' "
+             "heatmap inside the Advanced expander. It does NOT affect the "
+             "Cleaned-area KPI, which uses the intensity gate + passes "
+             "criterion above.")
     s.steady_state_only = container.checkbox(
         "Report KPIs on steady-state core only",
         value=s.steady_state_only,
@@ -1712,45 +1716,61 @@ def render_result(s: Scenario, strip: np.ndarray, m: dict,
             "simulated strip length so the step budget can resolve the "
             "path, or accept that point KPIs read low here.")
 
-    vmax = vmax_shared if vmax_shared is not None else max(strip.max(), 1e-6)
     array_span_x = m["array_span_x_mm"]
     cell = s.cell_size_mm
-    extent = [-array_span_x / 2, array_span_x / 2, strip.shape[0] * cell, 0]
 
-    fig, ax = plt.subplots(figsize=(8, 3.6))
-    im = ax.imshow(strip, extent=extent, aspect="auto",
-                   cmap="viridis", vmin=0, vmax=vmax)
-    if s.steady_state_only:
-        core_y0_mm = cy0 * cell
-        core_y1_mm = cy1 * cell
-        ax.add_patch(mpatches.Rectangle(
-            (extent[0], 0), extent[1] - extent[0], core_y0_mm,
-            facecolor="white", alpha=0.45, edgecolor="none"))
-        ax.add_patch(mpatches.Rectangle(
-            (extent[0], core_y1_mm), extent[1] - extent[0],
-            strip.shape[0] * cell - core_y1_mm,
-            facecolor="white", alpha=0.45, edgecolor="none"))
-        ax.axhline(core_y0_mm, color="red", lw=0.8, ls="--")
-        ax.axhline(core_y1_mm, color="red", lw=0.8, ls="--")
-    ax.set_xlabel("Across-track (mm)")
-    ax.set_ylabel("Along-track (mm)")
-    ax.set_title(f"{label}Exposure heatmap (bar*s per cell)")
-    plt.colorbar(im, ax=ax, label="bar*s")
-    container.pyplot(fig, clear_figure=True)
+    # ---- Exposure dose (bar·s) — diagnostic only, demoted into an expander.
+    # The cleaning verdict is the gated Cleaned-area KPI above; bar·s is a
+    # secondary lens on how exposure is distributed, not a clean/not-clean
+    # decision (it ignores the intensity threshold). Kept collapsed so it
+    # doesn't compete with the headline metrics.
+    with container.expander(
+            "Advanced: exposure dose (bar·s) — diagnostic, not the verdict"):
+        st.caption(
+            "Integrated jet-pressure exposure per cell. This is a **dose** "
+            "diagnostic for spotting thin tracks and overlap quality — it "
+            "does **not** decide cleaning (that is the gated Cleaned-area "
+            "KPI above, which also requires the jet to clear the intensity "
+            "threshold). A high bar·s below the intensity gate still cleans "
+            "nothing.")
+        vmax = vmax_shared if vmax_shared is not None else max(strip.max(), 1e-6)
+        extent = [-array_span_x / 2, array_span_x / 2, strip.shape[0] * cell, 0]
+        fig, ax = plt.subplots(figsize=(8, 3.6))
+        im = ax.imshow(strip, extent=extent, aspect="auto",
+                       cmap="viridis", vmin=0, vmax=vmax)
+        if s.steady_state_only:
+            core_y0_mm = cy0 * cell
+            core_y1_mm = cy1 * cell
+            ax.add_patch(mpatches.Rectangle(
+                (extent[0], 0), extent[1] - extent[0], core_y0_mm,
+                facecolor="white", alpha=0.45, edgecolor="none"))
+            ax.add_patch(mpatches.Rectangle(
+                (extent[0], core_y1_mm), extent[1] - extent[0],
+                strip.shape[0] * cell - core_y1_mm,
+                facecolor="white", alpha=0.45, edgecolor="none"))
+            ax.axhline(core_y0_mm, color="red", lw=0.8, ls="--")
+            ax.axhline(core_y1_mm, color="red", lw=0.8, ls="--")
+        ax.set_xlabel("Across-track (mm)")
+        ax.set_ylabel("Along-track (mm)")
+        ax.set_title(f"{label}Exposure dose (bar*s per cell)")
+        plt.colorbar(im, ax=ax, label="bar*s")
+        st.pyplot(fig, clear_figure=True)
 
-    region = strip[cy0:cy1, cx0:cx1] if s.steady_state_only else strip
-    region_extent_y = (cy1 - cy0) * cell if s.steady_state_only \
-        else strip.shape[0] * cell
-    fig_t, ax_t = plt.subplots(figsize=(8, 2.8))
-    ax_t.imshow(
-        (region >= s.clean_threshold).astype(np.float32),
-        extent=[-array_span_x / 2, array_span_x / 2, region_extent_y, 0],
-        aspect="auto", cmap="Greens", vmin=0, vmax=1,
-    )
-    ax_t.set_xlabel("Across-track (mm)")
-    ax_t.set_ylabel("Along-track (mm)")
-    ax_t.set_title(f"{label}Cleaned cells (green = >= {s.clean_threshold:.1f} bar*s)")
-    container.pyplot(fig_t, clear_figure=True)
+        region = strip[cy0:cy1, cx0:cx1] if s.steady_state_only else strip
+        region_extent_y = (cy1 - cy0) * cell if s.steady_state_only \
+            else strip.shape[0] * cell
+        fig_t, ax_t = plt.subplots(figsize=(8, 2.8))
+        ax_t.imshow(
+            (region >= s.clean_threshold).astype(np.float32),
+            extent=[-array_span_x / 2, array_span_x / 2, region_extent_y, 0],
+            aspect="auto", cmap="Greens", vmin=0, vmax=1,
+        )
+        ax_t.set_xlabel("Across-track (mm)")
+        ax_t.set_ylabel("Along-track (mm)")
+        ax_t.set_title(
+            f"{label}Cells above dose threshold "
+            f"(green = >= {s.clean_threshold:.2f} bar*s)")
+        st.pyplot(fig_t, clear_figure=True)
 
 
 # -----------------------------------------------------------------------------
@@ -2455,11 +2475,13 @@ else:
 
         st.subheader("Delta (B − A)")
         keys = [
-            ("coverage_pct", "Cleaned area (%)", "+"),
-            ("p50_bs", "Median exposure (bar*s)", "+"),
-            ("p10_bs", "10th-pct exposure (bar*s)", "+"),
-            ("mean_bs", "Mean exposure (bar*s)", "+"),
+            ("cleaned_pct", "Cleaned area (%)", "+"),
+            ("stagnation_pressure_bar", "Delivered pressure (bar)", "+"),
+            ("median_passes", "Median passes", "+"),
             ("missed_pct", "Untouched (%)", "-"),
+            # Exposure dose (bar·s) — diagnostic, shown last.
+            ("p50_bs", "Median exposure dose (bar·s)", "+"),
+            ("mean_bs", "Mean exposure dose (bar·s)", "+"),
         ]
         rows = []
         for key, label, better in keys:
