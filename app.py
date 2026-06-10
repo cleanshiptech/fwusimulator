@@ -481,6 +481,180 @@ def plot_side(s: Scenario) -> plt.Figure:
 
 
 # -----------------------------------------------------------------------------
+# Zoomed spray profile (single nozzle, close-up of exit -> hull)
+# -----------------------------------------------------------------------------
+@st.cache_data(show_spinner=False)
+def plot_spray_profile_cached(key: tuple, _scen_bytes: bytes) -> plt.Figure:
+    import pickle
+    return _plot_spray_profile_impl(pickle.loads(_scen_bytes))
+
+
+def _plot_spray_profile_impl(s: Scenario) -> plt.Figure:
+    """
+    Close-up of a SINGLE nozzle jet from the exit orifice down to the hull,
+    at the true mm scale. The main side view is dominated by the ~360 mm
+    disc, so the mm-scale jet (exit dia, spread, footprint) is invisible
+    there; this panel zooms in on just the jet column.
+    """
+    fp_d = s.footprint_dia()
+    d0 = s.nozzle_exit_mm
+    L = float(s.standoff_mm)
+    cant = math.radians(s.nozzle_cant_deg)
+    dx_hull = L * math.tan(cant)           # horizontal cant shift over standoff
+
+    fig, ax = plt.subplots(figsize=(5.5, 3.4))
+
+    # Hull line.
+    ax.axhline(0, color="#555", lw=2.0, zorder=1)
+    # Nozzle body block at the top (exit at y = L).
+    body_h = max(L * 0.35, 4.0)
+    ax.add_patch(mpatches.Rectangle(
+        (-max(d0, 2.0) * 2.0, L), max(d0, 2.0) * 4.0, body_h,
+        facecolor="#cfe3f5", edgecolor="#1f77b4", zorder=3))
+    ax.text(0, L + body_h / 2, "nozzle", ha="center", va="center", fontsize=8)
+
+    # Spreading jet cone: exit (width d0) at top, footprint (width fp_d) at hull,
+    # centre line canted by dx_hull.
+    cone = mpatches.Polygon(
+        [(-d0 / 2, L), (d0 / 2, L),
+         (dx_hull + fp_d / 2, 0), (dx_hull - fp_d / 2, 0)],
+        closed=True, facecolor="#ff7f0e", alpha=0.25, edgecolor="#ff7f0e",
+        linewidth=1.0, zorder=2)
+    ax.add_patch(cone)
+    ax.plot([0, dx_hull], [L, 0], color="#ff7f0e", lw=1.2, ls="--", zorder=4)
+
+    # Footprint mark on the hull.
+    ax.add_patch(mpatches.Ellipse(
+        (dx_hull, 0), fp_d, max(fp_d * 0.12, 1.0),
+        facecolor="#ff7f0e", alpha=0.7, edgecolor="none", zorder=4))
+
+    # Dimension: exit diameter (top).
+    ax.annotate("", xy=(-d0 / 2, L + body_h + 2), xytext=(d0 / 2, L + body_h + 2),
+                arrowprops=dict(arrowstyle="<->", color="#1f77b4", lw=1.0))
+    ax.text(0, L + body_h + 3, f"exit {d0:.1f} mm",
+            color="#1f77b4", ha="center", va="bottom", fontsize=8)
+
+    # Dimension: standoff (left).
+    x_so = -fp_d / 2 - max(fp_d * 0.4, 4.0)
+    ax.annotate("", xy=(x_so, 0), xytext=(x_so, L),
+                arrowprops=dict(arrowstyle="<->", color="#333", lw=1.0))
+    ax.text(x_so - 1, L / 2, f"standoff\n{L:.0f} mm",
+            color="#333", ha="right", va="center", fontsize=8)
+
+    # Dimension: footprint diameter (bottom).
+    ax.annotate("", xy=(dx_hull - fp_d / 2, -max(fp_d * 0.5, 4.0)),
+                xytext=(dx_hull + fp_d / 2, -max(fp_d * 0.5, 4.0)),
+                arrowprops=dict(arrowstyle="<->", color="#d9660a", lw=1.2))
+    ax.text(dx_hull, -max(fp_d * 0.5, 4.0) - 1, f"footprint {fp_d:.1f} mm",
+            color="#d9660a", ha="center", va="top", fontsize=8, fontweight="bold")
+
+    # Cant angle label near the exit.
+    if s.nozzle_cant_deg > 0:
+        ax.text(d0 / 2 + 1, L * 0.75, f"{s.nozzle_cant_deg}° cant",
+                color="#ff7f0e", ha="left", va="center", fontsize=8)
+
+    span = max(fp_d, d0, dx_hull * 2) * 1.6 + 8
+    ax.set_xlim(-span, span)
+    ax.set_ylim(-max(fp_d * 0.5, 4.0) - 8, L + body_h + 10)
+    ax.set_aspect("equal")
+    ax.set_xlabel("Across jet axis (mm)")
+    ax.set_ylabel("Height above hull (mm)")
+    ax.set_title("Spray profile (one nozzle, zoomed)")
+    ax.grid(True, alpha=0.25)
+    return fig
+
+
+def plot_spray_profile(s: Scenario) -> plt.Figure:
+    import pickle
+    return plot_spray_profile_cached(scenario_key(s), pickle.dumps(s))
+
+
+# -----------------------------------------------------------------------------
+# Single-disc coverage diagnostic (ring gap detector)
+# -----------------------------------------------------------------------------
+def single_disc_coverage(s: Scenario) -> dict:
+    """
+    Run the pressure sim for a SINGLE disc on a fine grid and measure whether
+    its swept annulus is continuous (no gaps) as the disc advances.
+
+    Returns the touched/untouched map plus the key geometric numbers:
+      - forward advance per revolution and the effective forward pitch
+        (advance / n_nozzles), vs the footprint diameter — the overlap
+        condition for a gap-free along-track track;
+      - annulus fill fraction: of the cells inside the swept ring band
+        (radius in [r_ring - fp, r_ring + fp]), how many got any exposure.
+    """
+    one = deepcopy(s)
+    one.n_row1 = 1
+    one.n_row2 = 1
+    one.array_width_mm = max(one.disc_diameter_mm + 40, 400)
+    # Fine grid so a mm-scale footprint is resolved; short strip = a few revs.
+    one.cell_size_mm = min(s.cell_size_mm, 2.0)
+    rov_mm_s = max(one.rov_speed_kn * KNOTS_TO_MPS * 1000.0, 1e-6)
+    rev_s = one.rpm / 60.0
+    advance_per_rev = rov_mm_s / max(rev_s, 1e-6)
+    # Simulate enough length to see several full revolutions sweep past.
+    one.sim_length_mm = int(max(6 * advance_per_rev, 2 * one.disc_diameter_mm, 400))
+    one.steady_state_only = False
+
+    strip, m, box = simulate_pressure(one)
+    cell = one.cell_size_mm
+    touched = strip > 0.0
+
+    fp_d = one.footprint_dia()
+    n_noz = max(one.n_nozzles, 1)
+    eff_pitch = advance_per_rev / n_noz
+    overlap = eff_pitch < fp_d
+
+    # The reliable gap signal is the analytical overlap condition
+    # (eff_pitch vs footprint); the green map below shows it visually. We
+    # avoid measuring a gap from pixels — a vertical cut through the ring's
+    # near-tangent legs aliases the discrete blobs and gives a noisy number.
+    ir = one.impact_radius_mm()
+    ny, nx = strip.shape
+    cx = nx / 2.0
+    overlap_margin = fp_d - eff_pitch   # >0 = overlap, <0 = gap of this width
+
+    return {
+        "strip": strip,
+        "touched": touched,
+        "cell": cell,
+        "box": box,
+        "advance_per_rev_mm": advance_per_rev,
+        "eff_pitch_mm": eff_pitch,
+        "footprint_mm": fp_d,
+        "overlap": bool(overlap),
+        "overlap_margin_mm": overlap_margin,
+        "n_nozzles": n_noz,
+        "ring_r_mm": ir,
+        "cx": cx,
+    }
+
+
+def plot_single_disc_coverage(s: Scenario) -> tuple[plt.Figure, dict]:
+    d = single_disc_coverage(s)
+    touched = d["touched"]
+    cell = d["cell"]
+    ny, nx = touched.shape
+    extent = [-nx / 2 * cell, nx / 2 * cell, ny * cell, 0]
+
+    fig, ax = plt.subplots(figsize=(5.5, 4.4))
+    # Touched cells in solid colour over an untouched background.
+    ax.imshow(touched.astype(float), extent=extent, aspect="equal",
+              cmap="Greens", vmin=0, vmax=1.4, interpolation="nearest")
+    # Overlay the theoretical ring-band edges.
+    ir = d["ring_r_mm"]
+    fp = d["footprint_mm"]
+    for xr in (ir, -ir):
+        ax.axvline(xr, color="#1f77b4", lw=0.7, ls=":")
+    ax.set_xlabel("Across-track (mm)")
+    ax.set_ylabel("Along-track (mm)")
+    status = "OVERLAP — gap-free" if d["overlap"] else "GAP RISK"
+    ax.set_title(f"Single-disc swept coverage — {status}")
+    return fig, d
+
+
+# -----------------------------------------------------------------------------
 # Footprint sensitivity: impact-zone diameter vs standoff & nozzle exit dia
 # -----------------------------------------------------------------------------
 @st.cache_data(show_spinner=False)
@@ -1494,6 +1668,52 @@ if not compare_mode:
         with right:
             st.subheader("Side view (one disc)")
             st.pyplot(plot_side(scen), clear_figure=False)
+            st.caption(
+                "Zoomed spray profile — the same jet at true mm scale "
+                "(the side view above is dominated by the disc width).")
+            st.pyplot(plot_spray_profile(scen), clear_figure=False)
+
+        st.divider()
+        st.subheader("Single-disc coverage — ring gap check")
+        st.caption(
+            "Does one disc lay down a continuous swept ring as it advances, "
+            "or do the rings separate into gaps? Green = swept by this disc. "
+            "A single disc only cleans its **annulus** (ring), not a filled "
+            "circle — the swath is completed by adjacent discs and rows.")
+        fig_cov, cov = plot_single_disc_coverage(scen)
+        cov_l, cov_r = st.columns([1.0, 1.0])
+        with cov_l:
+            st.pyplot(fig_cov, clear_figure=True)
+        with cov_r:
+            k1, k2 = st.columns(2)
+            k1.metric("Forward advance / rev", f"{cov['advance_per_rev_mm']:.1f} mm")
+            k2.metric("Effective pitch",
+                      f"{cov['eff_pitch_mm']:.1f} mm",
+                      help=f"= advance/rev ÷ {cov['n_nozzles']} nozzles. The "
+                           "along-track spacing between successive nozzle "
+                           "passes over a fixed point.")
+            k3, k4 = st.columns(2)
+            k3.metric("Footprint", f"{cov['footprint_mm']:.1f} mm")
+            _m = cov["overlap_margin_mm"]
+            k4.metric("Overlap margin",
+                      f"{_m:+.1f} mm",
+                      delta="overlap" if _m >= 0 else "gap",
+                      delta_color="normal" if _m >= 0 else "inverse",
+                      help="footprint − effective pitch. Positive = "
+                           "successive passes overlap (gap-free); negative = "
+                           "a gap of this width opens between rings.")
+            if cov["overlap"]:
+                st.success(
+                    f"Gap-free along-track: effective pitch "
+                    f"{cov['eff_pitch_mm']:.1f} mm < footprint "
+                    f"{cov['footprint_mm']:.1f} mm, so successive passes "
+                    "overlap. No 'circles' marching forward.")
+            else:
+                st.warning(
+                    f"Gap risk: effective pitch {cov['eff_pitch_mm']:.1f} mm "
+                    f"≥ footprint {cov['footprint_mm']:.1f} mm — successive "
+                    "passes separate into discrete rings. Slow the traverse, "
+                    "add nozzles, or raise RPM to close the gap.")
 
         if scen.footprint_mode.startswith("Physical jet"):
             st.subheader("Impact zone vs nozzle exit & standoff")
