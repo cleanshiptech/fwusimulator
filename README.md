@@ -88,6 +88,24 @@ coverage (more nozzles) and intensity (pressure per nozzle) that the sidebar
 shows live. Set the total pump flow and the exit diameter; pressure is
 reported, not dialled.
 
+## Grid resolution & the sampling law
+
+The cleaned-area KPI is computed on a discrete hull grid, and there is a
+**Nyquist–Shannon-style sampling criterion**: to represent the footprint
+(the smallest spatial feature, diameter `d_fp`) without aliasing, **both**
+the grid cell and the jet's per-step advance along its ring must be small
+relative to it. If a cell sits near `d_fp/2 … d_fp/3` the swept track beats
+against the grid and the cleaned-area KPI wobbles with the (arbitrary) grid
+choice.
+
+To avoid this the app uses **auto grid resolution** by default: the cell is
+derived from the footprint, `cell ≈ d_fp / 4`, so the disk is always ~4
+cells across, and the jet path is time-stepped finer than the grid
+(`arc_per_step ≤ cell/4`). With this, the result is resolution-independent
+(cleaned-area varies < ~1 % across resolutions in the well-sampled zone).
+Manual grid selection is still available as an override, with a warning when
+the chosen cell under-resolves the footprint (< ~3 cells across).
+
 ## Parameters
 
 Array geometry
