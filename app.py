@@ -115,7 +115,8 @@ class Scenario:
     # Hull strip & threshold
     sim_length_mm: int = 2000
     clean_threshold: float = 0.5    # bar·s — dose heatmap threshold only
-    cell_size_mm: float = 5.0       # hull-grid resolution
+    auto_grid: bool = True          # derive cell size from the footprint
+    cell_size_mm: float = 5.0       # manual hull-grid resolution (when auto off)
 
     # Cleaning criterion: an intensity GATE (jet stagnation pressure at the
     # hull must exceed a removal threshold for the fouling type) plus a DOSE
@@ -188,6 +189,21 @@ class Scenario:
             - self.standoff_mm * math.tan(math.radians(self.nozzle_cant_deg)),
         )
 
+    @property
+    def resolved_cell_mm(self) -> float:
+        """
+        Hull-grid cell size actually used by the sim. In auto mode it is
+        derived from the footprint (≈ footprint / 4) so the disk is always
+        well-resolved (≥ ~4 cells across) and the result no longer swings
+        with an arbitrary grid choice. Clamped to a sane range.
+        """
+        if self.auto_grid:
+            # Lower clamp 1.0 mm: finer than that re-introduces a little
+            # wobble (gate-radius vs hit-spacing) AND blows up runtime under
+            # the step cap, with no accuracy gain. Upper clamp 5 mm.
+            return float(min(max(self.footprint_dia() / 4.0, 1.0), 5.0))
+        return float(self.cell_size_mm)
+
 
 def scenario_key(s: Scenario) -> tuple:
     """Hashable key for caching — only geometry-affecting params."""
@@ -196,7 +212,7 @@ def scenario_key(s: Scenario) -> tuple:
             s.nozzle_radius_mm, s.nozzle_cant_deg, s.standoff_mm,
             s.counter_rotate, s.pressure_bar, s.footprint_mode,
             s.footprint_dia_mm_override, s.nozzle_exit_mm, s.jet_spread_deg,
-            s.cell_size_mm, s.total_flow_lpm)
+            s.resolved_cell_mm, s.total_flow_lpm)
 
 
 def scenario_full_key(s: Scenario) -> tuple:
@@ -282,20 +298,6 @@ def scenario_controls(prefix: str, defaults: Scenario, container) -> Scenario:
         "Adding nozzles or widening the exit lowers this.")
 
     container.subheader("Jet footprint model")
-    _grid_opts = [10.0, 5.0, 2.0, 1.0]
-    _grid_idx = (_grid_opts.index(s.cell_size_mm)
-                 if s.cell_size_mm in _grid_opts else 1)
-    s.cell_size_mm = container.selectbox(
-        "Hull grid resolution (mm/cell)", _grid_opts, index=_grid_idx,
-        format_func=lambda v: f"{v:g} mm"
-        + {10.0: "  (fast)", 1.0: "  (true footprint, slower)"}.get(v, ""),
-        key=k("cell_size_mm"),
-        help="Cell size of the hull grid. Finer grids resolve small "
-             "(sub-cm) physical footprints but cost ~1/cell² in memory "
-             "and up to ~1/cell⁴ in compute. The deposit loop is "
-             "vectorised, so 1–2 mm stays responsive for the small "
-             "physical-jet footprint; the legacy large footprint is "
-             "heavier at 1 mm.")
     _fp_modes = [
         "Physical jet (exit dia + standoff)",
         "Linear with pressure (60->80 mm)",
@@ -333,20 +335,40 @@ def scenario_controls(prefix: str, defaults: Scenario, container) -> Scenario:
     else:
         container.caption(f"Footprint diameter on hull: **{s.footprint_dia():.1f} mm**")
 
-    # Mode-independent resolution check: the footprint must span enough cells
-    # to be represented as a disk (and to resolve the delivered-pressure
-    # gradient). Below ~2 cells it collapses toward a single pixel and the
-    # spatial KPIs (cleaned area, pressure contour) get unreliable.
-    _fp_cells = s.footprint_dia() / s.cell_size_mm
-    if _fp_cells < 2.0:
-        container.warning(
-            f"⚠ Footprint ({s.footprint_dia():.1f} mm) spans only "
-            f"{_fp_cells:.1f} grid cells at {s.cell_size_mm:g} mm resolution, "
-            "so it can't be resolved as a disk — the heatmaps and cleaned-area "
-            "KPI will be unreliable (the footprint collapses toward a single "
-            "cell). **Lower the hull grid resolution** (above) to at least "
-            f"~{s.footprint_dia() / 3:.0f} mm, or widen the footprint "
-            "(standoff / spread / exit).")
+    # Hull-grid resolution. Auto (default) derives the cell from the footprint
+    # so the disk is always well-resolved (~4 cells across) and the KPIs don't
+    # swing with an arbitrary grid choice. The sampling rule is Nyquist-like:
+    # the grid (and the jet-path time-step) must be fine enough relative to the
+    # footprint, or the swept track aliases and the cleaned-area KPI wobbles.
+    s.auto_grid = container.checkbox(
+        "Auto grid resolution (recommended)", value=s.auto_grid,
+        key=k("auto_grid"),
+        help="Derive the calculation cell from the footprint "
+             "(cell ≈ footprint / 4) so the result is resolution-independent. "
+             "Turn off to pick a cell size manually.")
+    if s.auto_grid:
+        container.caption(
+            f"Grid: **{s.resolved_cell_mm:.2f} mm/cell** "
+            f"(= {s.footprint_dia():.1f} mm footprint ÷ 4). The footprint "
+            f"spans ~{s.footprint_dia() / s.resolved_cell_mm:.0f} cells.")
+    else:
+        _grid_opts = [10.0, 5.0, 2.0, 1.0]
+        _grid_idx = (_grid_opts.index(s.cell_size_mm)
+                     if s.cell_size_mm in _grid_opts else 1)
+        s.cell_size_mm = container.selectbox(
+            "Hull grid resolution (mm/cell)", _grid_opts, index=_grid_idx,
+            format_func=lambda v: f"{v:g} mm", key=k("cell_size_mm"),
+            help="Manual cell size. Note the Nyquist trap: a cell near "
+                 "footprint/2–footprint/3 can ALIAS the swept track and make "
+                 "the cleaned-area KPI wobble. Prefer auto, or keep "
+                 "cell ≤ footprint/4.")
+        _fp_cells = s.footprint_dia() / s.cell_size_mm
+        if _fp_cells < 3.0:
+            container.warning(
+                f"⚠ Footprint ({s.footprint_dia():.1f} mm) spans only "
+                f"{_fp_cells:.1f} cells at {s.cell_size_mm:g} mm — under-"
+                "resolved, the cleaned-area KPI is unreliable here. Use auto "
+                f"grid, or pick ≤ {s.footprint_dia() / 4:.1f} mm.")
     s.pressure_profile = container.radio(
         "Pressure distribution within footprint",
         ["Uniform", "Gaussian (peak at centre)"],
@@ -709,7 +731,8 @@ def single_disc_coverage(s: Scenario) -> dict:
     one.n_row2 = 1
     one.array_width_mm = max(one.disc_diameter_mm + 40, 400)
     # Fine grid so a mm-scale footprint is resolved; short strip = a few revs.
-    one.cell_size_mm = min(s.cell_size_mm, 2.0)
+    one.auto_grid = False
+    one.cell_size_mm = min(s.resolved_cell_mm, 2.0)
     rov_mm_s = max(one.rov_speed_kn * KNOTS_TO_MPS * 1000.0, 1e-6)
     rev_s = one.rpm / 60.0
     advance_per_rev = rov_mm_s / max(rev_s, 1e-6)
@@ -879,7 +902,7 @@ def footprint_stencil(s: Scenario) -> np.ndarray:
     uniform energy, collapsing the bar·s KPIs.
     """
     r_mm = s.footprint_dia() / 2.0
-    r_cells = r_mm / s.cell_size_mm
+    r_cells = r_mm / s.resolved_cell_mm
     half = int(math.ceil(r_cells)) + 1
     yy, xx = np.ogrid[-half:half + 1, -half:half + 1]
     r2 = (xx ** 2 + yy ** 2).astype(np.float32)
@@ -907,7 +930,7 @@ def footprint_profile_peaknorm(s: Scenario) -> np.ndarray:
     above, which is for the bar·s dose).
     """
     r_mm = s.footprint_dia() / 2.0
-    r_cells = r_mm / s.cell_size_mm
+    r_cells = r_mm / s.resolved_cell_mm
     half = int(math.ceil(r_cells)) + 1
     yy, xx = np.ogrid[-half:half + 1, -half:half + 1]
     r2 = (xx ** 2 + yy ** 2).astype(np.float32)
@@ -1055,7 +1078,7 @@ def simulate_pressure(s: Scenario, t_stop_s: float | None = None
     full_extent = s.sim_length_mm + array_span_y + 2 * margin_mm
     width_extent = array_span_x + 2 * margin_mm
 
-    cell = s.cell_size_mm
+    cell = s.resolved_cell_mm
     nx = int(width_extent / cell)
     ny = int(full_extent / cell)
     grid = np.zeros((ny, nx), dtype=np.float32)
@@ -1074,18 +1097,22 @@ def simulate_pressure(s: Scenario, t_stop_s: float | None = None
     v_tan = omega_rad_s * max(ir, 1e-6)            # mm/s along the ring
     dt_rot = math.radians(5.0) / max(omega_rad_s, 1e-6)
     dt_trav = 0.5 * cell / max(rov_speed_mm_s, 1e-6)
-    dt_arc = 0.5 * max(fp_d, cell) / max(v_tan, 1e-6)  # footprint can't skip
+    # Sampling (Nyquist): the jet must advance no more than a quarter of a
+    # CELL per step along its ring, so the swept track is sampled finer than
+    # the grid and doesn't alias into a beat pattern with it (which made the
+    # KPIs swing with cell size). Tighter than the old 0.5·footprint rule.
+    dt_arc = 0.25 * cell / max(v_tan, 1e-6)
     dt = min(dt_rot, dt_trav, dt_arc)
     total_time_full = s.sim_length_mm / max(rov_speed_mm_s, 1e-6)
     total_time = total_time_full if t_stop_s is None else min(t_stop_s, total_time_full)
     n_steps_ideal = int(total_time / dt) + 1
-    # Cap to bound runtime, but record whether the cap forced a coarser dt
-    # than the jet-path constraint wants (i.e. the track is undersampled).
-    STEP_CAP = 60000
+    # Cap to bound runtime; record whether the cap forced a coarser dt than
+    # the path-sampling constraint wants (track then undersampled / aliased).
+    STEP_CAP = 400000
     n_steps = min(n_steps_ideal, STEP_CAP)
     dt = total_time / max(n_steps, 1)
     arc_per_step = v_tan * dt
-    undersampled = arc_per_step > max(fp_d, cell)
+    undersampled = arc_per_step > cell
 
     stencil = footprint_stencil(s)
     sh, sw = stencil.shape
@@ -1379,7 +1406,7 @@ def plot_motion_fast(s: Scenario, t_now_s: float,
         rxs_rot = [r[0] for r in rotated]
         array_span_x = max(rxs_rot) - min(rxs_rot) + s.disc_diameter_mm
         extent = [-array_span_x / 2, array_span_x / 2,
-                  cumulative_strip.shape[0] * s.cell_size_mm, 0]
+                  cumulative_strip.shape[0] * s.resolved_cell_mm, 0]
         vmax = max(float(cumulative_strip.max()), 1e-6)
         ax.imshow(cumulative_strip, extent=extent, aspect="auto",
                   cmap="viridis", vmin=0, vmax=vmax, alpha=0.7, zorder=0)
@@ -1860,7 +1887,7 @@ def render_result(s: Scenario, strip: np.ndarray, m: dict,
             "path, or accept that point KPIs read low here.")
 
     array_span_x = m["array_span_x_mm"]
-    cell = s.cell_size_mm
+    cell = s.resolved_cell_mm
 
     # ---- PRIMARY: two side-by-side maps — # passes and accumulated exposure
     # Two distinct, structure-preserving fields:
