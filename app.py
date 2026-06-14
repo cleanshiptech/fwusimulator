@@ -100,11 +100,21 @@ class Scenario:
     rpm: int = 850
     rov_speed_kn: float = 0.3
     nozzle_exit_mm: float = 1.3
-    # Nozzle pressure is DERIVED, not set: the pumps deliver a fixed total
-    # flow, which is split across all nozzles, and each nozzle's pressure
-    # follows from the orifice law Q = K·d²·√p. So adding nozzles or widening
-    # the exit lowers the pressure. total_flow_lpm is the pump capacity.
-    total_flow_lpm: float = 270.0   # 2 Denjet pumps
+    # The pumps deliver a fixed total flow split across all nozzles; the jet
+    # exit velocity follows from continuity (v = Q/A per nozzle), and the
+    # impact at the hull follows from the submerged-jet decay below.
+    total_flow_lpm: float = 270.0   # 2 Denjet CE100-300 pumps (135 Lpm each)
+
+    # Jet / impact physics (submerged turbulent free jet). All "assumed"
+    # values are calibratable — replace with measured numbers from a film /
+    # dye firing test (see jet_velocity_at_hull / impact measures below).
+    water_density: float = 1000.0      # kg/m³ (fresh; 1026 seawater)
+    nozzle_cd: float = 0.92            # discharge coeff (derived ref. 140 bar — verify)
+    decay_K: float = 5.5              # far-field centreline decay constant (assumed)
+    core_factor: float = 5.0          # potential-core length = factor · exit dia (straight bore)
+    jet_half_angle_deg: float = 14.0  # free-jet spread half-angle (assumed — measure)
+    skin_friction_cf: float = 0.003   # wall-jet skin-friction coeff for shear (assumed)
+    cleaning_measure: str = "Wall shear stress"  # which measure gates cleaning
 
     # Jet footprint model
     footprint_mode: str = "Physical jet (exit dia + standoff)"
@@ -118,12 +128,12 @@ class Scenario:
     auto_grid: bool = True          # derive cell size from the footprint
     cell_size_mm: float = 5.0       # manual hull-grid resolution (when auto off)
 
-    # Cleaning criterion: an intensity GATE (jet stagnation pressure at the
+    # Cleaning criterion: an intensity GATE (the chosen impact measure at the
     # hull must exceed a removal threshold for the fouling type) plus a DOSE
-    # gate (a minimum number of nozzle passes over the cell).
-    removal_pressure_bar: float = 15.0   # P_stag at hull needed to lift fouling
+    # gate (a minimum number of nozzle passes over the cell). The threshold
+    # units follow cleaning_measure: bar for stagnation/mean, kPa for shear.
+    removal_pressure_bar: float = 6.0    # default ~ soft biofilm in kPa shear
     min_passes: int = 2                  # passes required once above the gate
-    jet_core_factor: float = 6.0         # potential-core length = factor · exit_dia
 
     # Post-processing
     steady_state_only: bool = True
@@ -138,38 +148,81 @@ class Scenario:
         """Pump flow divided evenly across every nozzle (L/min)."""
         return self.total_flow_lpm / max(self.n_nozzles_total, 1)
 
+    # ---- Jet exit state (from flow continuity) ---------------------------
+    @property
+    def nozzle_exit_area_m2(self) -> float:
+        d = self.nozzle_exit_mm / 1000.0
+        return math.pi * (d / 2.0) ** 2
+
+    @property
+    def jet_exit_velocity(self) -> float:
+        """Jet exit velocity v = Q/A per nozzle (m/s). Q = flow per nozzle."""
+        q_m3s = self.flow_per_nozzle_lpm / 1000.0 / 60.0
+        return q_m3s / max(self.nozzle_exit_area_m2, 1e-12)
+
     @property
     def pressure_bar(self) -> float:
         """
-        Nozzle pressure DERIVED from the fixed pump flow. Inverting the
-        orifice law Q = K·d²·√p for one nozzle's share of the total flow:
-            p = ( q_per_nozzle / (K · d²) )².
-        More nozzles or a larger exit ⇒ more total orifice area ⇒ lower
-        pressure for the same pump flow.
+        Jet dynamic (stagnation) pressure at the EXIT, ½ρv². This is the
+        'nozzle-side' impact pressure the jet starts with; the value reaching
+        the hull is lower after the submerged-jet decay (see below). Replaces
+        the earlier orifice-law nozzle pressure with the physically correct
+        ½ρv² from the exit velocity.
         """
-        d = max(self.nozzle_exit_mm, 1e-6)
-        q = self.flow_per_nozzle_lpm
-        return (q / (ORIFICE_K * d ** 2)) ** 2
+        return 0.5 * self.water_density * self.jet_exit_velocity ** 2 / 1e5
 
-    def stagnation_pressure_bar(self) -> float:
-        """
-        Jet stagnation pressure delivered at the hull. A submerged free jet
-        holds its nozzle pressure within the potential core (length ≈
-        core_factor · exit_dia), then its centreline dynamic pressure decays
-        as (core_len / standoff)² beyond it. This is the physical 'cleaning
-        intensity' — what actually lifts fouling — and it is what makes
-        standoff and exit diameter the dominant power levers.
-        """
-        d0 = max(self.nozzle_exit_mm, 1e-6)
-        core_len = self.jet_core_factor * d0
-        # Jet path length to the hull (standoff along the canted axis).
-        L = self.standoff_mm / max(math.cos(math.radians(self.nozzle_cant_deg)),
-                                   1e-6)
-        if L <= core_len:
-            return float(self.pressure_bar)
-        return float(self.pressure_bar) * (core_len / L) ** 2
+    @property
+    def core_length_mm(self) -> float:
+        return self.core_factor * max(self.nozzle_exit_mm, 1e-6)
 
-    def footprint_dia(self) -> float:
+    def jet_velocity_at_hull(self, standoff_mm: float | None = None) -> float:
+        """
+        Centreline velocity reaching the hull (m/s) for a submerged turbulent
+        free jet. Constant v₀ within the potential core (≈ core_factor·d),
+        then decays as v_c/v₀ = K·d/x beyond it. x is the jet-axis path
+        length (standoff along the canted axis).
+        """
+        x = (self.standoff_mm if standoff_mm is None else standoff_mm)
+        x = x / max(math.cos(math.radians(self.nozzle_cant_deg)), 1e-6)
+        core = self.core_length_mm
+        v0 = self.jet_exit_velocity
+        if x <= core:
+            return v0
+        return v0 * self.decay_K * self.nozzle_exit_mm / x
+
+    # ---- Three impact measures at the hull (all from v_c) -----------------
+    def stagnation_pressure_bar(self, standoff_mm: float | None = None) -> float:
+        """(1) Centreline stagnation pressure ½ρv_c² (bar) — normal head-on
+        impact; drives hard-fouling fracture."""
+        v = self.jet_velocity_at_hull(standoff_mm)
+        return 0.5 * self.water_density * v ** 2 / 1e5
+
+    def mean_impact_pressure_bar(self, standoff_mm: float | None = None) -> float:
+        """(2) Total jet reaction force ÷ footprint area (bar) — bulk normal
+        load. Falls fast as the footprint grows with standoff."""
+        v0 = self.jet_exit_velocity
+        q_m3s = self.flow_per_nozzle_lpm / 1000.0 / 60.0
+        force = self.water_density * q_m3s * v0          # ρ·Q·v, N
+        fp_m = self.footprint_dia(standoff_mm) / 1000.0
+        area = math.pi * (fp_m / 2.0) ** 2
+        return (force / max(area, 1e-12)) / 1e5
+
+    def wall_shear_kpa(self, standoff_mm: float | None = None) -> float:
+        """(3) Wall shear stress τ = Cf·½ρv_c² (kPa) — tangential 'scrub' the
+        spreading jet exerts; the shear-removal cleaning mechanism."""
+        v = self.jet_velocity_at_hull(standoff_mm)
+        return self.skin_friction_cf * 0.5 * self.water_density * v ** 2 / 1000.0
+
+    def cleaning_intensity(self, standoff_mm: float | None = None) -> float:
+        """The impact measure that gates cleaning, per `cleaning_measure`.
+        Units depend on the choice: bar for stagnation/mean, kPa for shear."""
+        if self.cleaning_measure.startswith("Stagnation"):
+            return self.stagnation_pressure_bar(standoff_mm)
+        if self.cleaning_measure.startswith("Mean"):
+            return self.mean_impact_pressure_bar(standoff_mm)
+        return self.wall_shear_kpa(standoff_mm)
+
+    def footprint_dia(self, standoff_mm: float | None = None) -> float:
         if self.footprint_mode == "Manual override":
             return float(self.footprint_dia_mm_override)
         if self.footprint_mode.startswith("Linear with pressure"):
@@ -178,8 +231,9 @@ class Scenario:
         # half-angle θ over the standoff L, so its impingement footprint is
         #   d_fp = d0 + 2·L·tan(θ).
         # Both the nozzle exit diameter and the distance to the hull drive it.
+        x = self.standoff_mm if standoff_mm is None else standoff_mm
         return (self.nozzle_exit_mm
-                + 2.0 * self.standoff_mm
+                + 2.0 * x
                 * math.tan(math.radians(self.jet_spread_deg)))
 
     def impact_radius_mm(self) -> float:
@@ -219,7 +273,9 @@ def scenario_full_key(s: Scenario) -> tuple:
     """Full hashable key — all params that affect simulation output."""
     return (*scenario_key(s), s.rpm, s.rov_speed_kn, s.pressure_profile,
             s.sim_length_mm, s.clean_threshold, s.steady_state_only,
-            s.removal_pressure_bar, s.min_passes, s.jet_core_factor)
+            s.removal_pressure_bar, s.min_passes, s.core_factor,
+            s.cleaning_measure, s.nozzle_cd, s.decay_K, s.jet_half_angle_deg,
+            s.skin_friction_cf, s.water_density)
 
 
 # -----------------------------------------------------------------------------
@@ -377,40 +433,54 @@ def scenario_controls(prefix: str, defaults: Scenario, container) -> Scenario:
     )
 
     container.subheader("Cleaning criterion")
-    container.caption(
-        "Cleaning needs enough **impact pressure** (bar delivered at the "
-        "hull) AND enough **passes**. Impact pressure is the gate: below it, "
-        "no number of passes removes fouling.")
-    _foul_presets = {
-        "Soft biofilm / slime": 15.0,
-        "Light weed / early growth": 60.0,
-        "Hard calcareous / barnacle": 150.0,
-        "Custom": None,
-    }
+    # Which impact measure gates cleaning. Stagnation/Mean are in bar, Wall
+    # shear in kPa — see the System & Impact tab for all three vs standoff.
+    _measures = ["Wall shear stress", "Stagnation pressure",
+                 "Mean impact pressure"]
+    _m_idx = _measures.index(s.cleaning_measure) if s.cleaning_measure in _measures else 0
+    s.cleaning_measure = container.radio(
+        "Cleaning driver (impact measure)", _measures, index=_m_idx,
+        key=k("cleaning_measure"),
+        help="Which hull-impact quantity must clear the removal threshold. "
+             "Wall shear = tangential scrub (accelerated water shears fouling "
+             "off); Stagnation = head-on ½ρv² (hard-fouling fracture); Mean = "
+             "force ÷ footprint (bulk load). All three shown in the System & "
+             "Impact tab.")
+    _unit = "kPa" if s.cleaning_measure.startswith("Wall") else "bar"
+    # Per-measure fouling presets (typical removal thresholds, calibratable).
+    _presets = {
+        "Wall shear stress": {"Soft biofilm / slime": 6.0,
+                              "Light weed / early growth": 15.0,
+                              "Hard calcareous / barnacle": 30.0, "Custom": None},
+        "Stagnation pressure": {"Soft biofilm / slime": 15.0,
+                               "Light weed / early growth": 60.0,
+                               "Hard calcareous / barnacle": 150.0, "Custom": None},
+        "Mean impact pressure": {"Soft biofilm / slime": 8.0,
+                                "Light weed / early growth": 30.0,
+                                "Hard calcareous / barnacle": 80.0, "Custom": None},
+    }[s.cleaning_measure]
     _foul_choice = container.selectbox(
-        "Fouling type (sets removal pressure)",
-        list(_foul_presets.keys()),
-        index=0,
+        f"Fouling type (sets removal {_unit})", list(_presets.keys()), index=0,
         key=k("foul_preset"),
-        help="Minimum jet stagnation pressure at the hull needed to lift "
-             "this fouling. Calibrate against a known field result — set it "
-             "to the delivered pressure of a run you KNOW cleans your "
-             "fouling (shown live below).")
-    if _foul_presets[_foul_choice] is not None:
-        s.removal_pressure_bar = _foul_presets[_foul_choice]
+        help="Minimum delivered intensity needed to lift this fouling. "
+             "Calibrate to a run you KNOW cleans your fouling — the live "
+             "value at your standoff is shown below.")
+    if _presets[_foul_choice] is not None:
+        s.removal_pressure_bar = _presets[_foul_choice]
     else:
+        _hi = 100.0 if _unit == "kPa" else 400.0
         s.removal_pressure_bar = container.slider(
-            "Removal pressure at hull (bar)", 1.0, 400.0,
-            float(s.removal_pressure_bar), step=1.0,
+            f"Removal threshold ({_unit})", 0.5, _hi,
+            float(s.removal_pressure_bar), step=0.5,
             key=k("removal_pressure_bar"))
-    # Live readout of delivered (stagnation) pressure for the current jet.
-    _pstag = s.stagnation_pressure_bar()
-    _gate = "✅ above" if _pstag >= s.removal_pressure_bar else "❌ BELOW"
+    _val = s.cleaning_intensity()
+    _gate = "✅ above" if _val >= s.removal_pressure_bar else "❌ BELOW"
     container.caption(
-        f"Jet delivers **{_pstag:.0f} bar** at the hull "
-        f"({s.pressure_bar:.0f} bar at nozzle, decayed over "
-        f"{s.standoff_mm} mm standoff with {s.nozzle_exit_mm:.1f} mm exit) "
-        f"— {_gate} the {s.removal_pressure_bar:.0f} bar removal threshold.")
+        f"At {s.standoff_mm} mm standoff the jet delivers "
+        f"**{_val:.1f} {_unit}** ({s.cleaning_measure.lower()}) — {_gate} the "
+        f"{s.removal_pressure_bar:.1f} {_unit} removal threshold. "
+        f"(Exit v = {s.jet_exit_velocity:.0f} m/s, core "
+        f"{s.core_length_mm:.1f} mm.)")
     s.min_passes = container.slider(
         "Minimum passes to clean", 1, 10, int(s.min_passes), key=k("min_passes"),
         help="Once the intensity gate is cleared, a cell must be struck at "
@@ -1191,33 +1261,36 @@ def simulate_pressure(s: Scenario, t_stop_s: float | None = None
             c = np.fft.irfft2(H * K, s=(fy, fx))
             return c[2 * rr:2 * rr + ny, 2 * rr:2 * rr + nx].astype(np.float32)
 
+        # Cleaning intensity at the footprint centre (the chosen measure:
+        # stagnation / mean / wall shear). The per-cell value falls toward the
+        # footprint edge with the same peak-normalised profile.
+        intensity_peak = s.cleaning_intensity()
+
         if sh == 1 and sw == 1:
             # Single-cell footprint (sub-resolution jet): no spread to apply.
             hcore = hit[rr:rr + ny, rr:rr + nx]
             grid += hcore * weighted_stencil[0, 0]
             passes += hcore * binary_stencil[0, 0]
-            peak_pressure += (hcore > 0.5) * s.stagnation_pressure_bar()
+            peak_pressure += (hcore > 0.5) * intensity_peak
         else:
             # Energy (bar·s) and pass-count deposits via FFT convolution.
             grid += conv_with(weighted_stencil)
             passes += conv_with(binary_stencil)
 
-            # Peak delivered pressure per cell, built as a few nested bands.
-            # The peak pressure at a cell is P_stag · profile(d), d = distance
-            # to the nearest hit centre. Thresholding the peak-normalised
-            # profile at a few levels and presence-convolving each band marks
-            # cells within that band's radius of any hit; the max band reached
-            # is the delivered pressure. O(few · MN log MN), footprint-size
-            # independent — far cheaper than a per-cell max-dilation.
+            # Peak cleaning intensity per cell, built as a few nested bands.
+            # The intensity at a cell is intensity_peak · profile(d), d =
+            # distance to the nearest hit centre. Thresholding the peak-
+            # normalised profile at a few levels and presence-convolving each
+            # band marks cells within that band's radius of any hit; the max
+            # band reached is the delivered intensity.
             peak_prof = footprint_profile_peaknorm(s)
-            p_stag = s.stagnation_pressure_bar()
             bands = np.zeros((ny, nx), dtype=np.float32)
             for lv in (0.1, 0.25, 0.4, 0.55, 0.7, 0.85, 1.0):
                 sub = (peak_prof >= lv).astype(np.float32)
                 if sub.sum() == 0:
                     continue
                 covered = conv_with(sub) > 0.5
-                np.maximum(bands, covered * (lv * p_stag), out=bands)
+                np.maximum(bands, covered * (lv * intensity_peak), out=bands)
             peak_pressure += bands
 
     y_strip_start = 0
@@ -1252,12 +1325,13 @@ def simulate_pressure(s: Scenario, t_stop_s: float | None = None
         region_pressure = pressure_strip
 
     # --- Cleaning criterion: PER-CELL intensity gate × dose gate ----------
-    # Each cell has its own delivered pressure (the jet is more intense at
-    # the footprint centre than its edges), so the intensity gate is applied
-    # per cell, not globally. A cell is cleaned iff the pressure delivered
-    # there clears the removal threshold AND it received >= min passes.
-    p_stag = s.stagnation_pressure_bar()         # centreline (peak) delivered
-    intensity_ok = p_stag >= s.removal_pressure_bar   # can ANY cell clean?
+    # Each cell has its own delivered intensity (the chosen measure —
+    # stagnation / mean / wall shear — is highest at the footprint centre and
+    # falls toward the edges), so the intensity gate is per cell. A cell is
+    # cleaned iff the delivered intensity clears the removal threshold AND it
+    # received >= min passes.
+    intensity_peak = s.cleaning_intensity()       # centreline (peak) value
+    intensity_ok = intensity_peak >= s.removal_pressure_bar   # can ANY cell clean?
     # `passes` is a convolution, so it is fractional at footprint edges. Treat
     # < 0.5 of a pass as effectively unstruck ("untouched") so the three
     # categories (cleaned / partial / untouched) partition the area exactly.
@@ -1290,8 +1364,9 @@ def simulate_pressure(s: Scenario, t_stop_s: float | None = None
                        if region.size else 0.0,
         # New physically-gated cleaning coverage.
         "cleaned_pct": cleaned_pct,
-        "stagnation_pressure_bar": float(p_stag),
+        "stagnation_pressure_bar": float(intensity_peak),
         "intensity_ok": bool(intensity_ok),
+        "cleaning_measure": s.cleaning_measure,
         "median_passes": float(np.median(region_passes)) if region_passes.size else 0.0,
         "max_passes": float(region_passes.max()) if region_passes.size else 0.0,
         "median_pressure_bar": float(np.median(region_pressure[region_pressure > 0]))
@@ -1828,24 +1903,26 @@ def render_result(s: Scenario, strip: np.ndarray, m: dict,
                   label: str = "") -> None:
     cy0, cy1, cx0, cx1 = core_box
 
-    # Impact pressure gets its OWN box (units: bar, instantaneous force) so it
-    # is never read as comparable to the bar·s exposure maps below.
-    _pstag = m.get("stagnation_pressure_bar", 0)
+    # The cleaning-driver intensity gets its OWN box (its own units) so it is
+    # never read as comparable to the bar·s exposure maps below.
+    _val = m.get("stagnation_pressure_bar", 0)   # holds the chosen measure's value
+    _unit = "kPa" if s.cleaning_measure.startswith("Wall") else "bar"
+    _name = s.cleaning_measure.lower()
     if m.get("intensity_ok"):
         container.success(
-            f"**{label}Impact pressure: {_pstag:.0f} bar** delivered at the "
-            f"hull — clears the {s.removal_pressure_bar:.0f} bar removal gate "
-            f"for this fouling. (From {s.pressure_bar:.0f} bar at the nozzle, "
+            f"**{label}{s.cleaning_measure}: {_val:.1f} {_unit}** at the hull "
+            f"— clears the {s.removal_pressure_bar:.1f} {_unit} removal gate "
+            f"for this fouling. (Exit v = {s.jet_exit_velocity:.0f} m/s, "
             f"decayed over {s.standoff_mm} mm standoff with a "
             f"{s.nozzle_exit_mm:.1f} mm exit.) This is how *hard* the jet "
             "hits — distinct from the bar·s exposure maps below.")
     else:
         container.error(
-            f"**{label}Impact pressure: {_pstag:.0f} bar** delivered at the "
-            f"hull — BELOW the {s.removal_pressure_bar:.0f} bar removal gate, "
-            "so cleaned area is 0% no matter how many passes. Raise nozzle "
-            "pressure, shorten the standoff, or widen the nozzle exit to "
-            "deliver more pressure to the hull.")
+            f"**{label}{s.cleaning_measure}: {_val:.1f} {_unit}** at the hull "
+            f"— BELOW the {s.removal_pressure_bar:.1f} {_unit} removal gate, "
+            "so cleaned area is 0% no matter how many passes. Shorten the "
+            "standoff (biggest lever), raise flow, or narrow the exit to "
+            "deliver more intensity to the hull.")
 
     # The area splits three ways and sums to ~100%: cleaned (gate met),
     # partial (struck but under-gated), untouched (never struck).
