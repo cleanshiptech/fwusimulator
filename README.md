@@ -1,7 +1,8 @@
 # PWU Coverage Simulator
 
 Streamlit tool that simulates how the ROV [[Domains/product/robot|pressure washing unit]]
-(PWU) deposits jet pressure on the hull as it traverses, on a 1×1 cm grid.
+(PWU) cleans the hull as it traverses, on a hull grid auto-sized from the
+jet footprint (≈ footprint ÷ 4; Nyquist-based, see "Grid resolution" below).
 
 ## What it computes
 

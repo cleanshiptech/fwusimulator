@@ -96,11 +96,12 @@ if not compare_mode:
         # ---- The system as it is today -----------------------------------
         st.subheader("The system as it is today")
         st.markdown(
-            "Two pumps feed one umbilical down to the ROV-mounted wash unit, "
-            "whose rotating discs fire jets at the hull. Flow (and so "
-            "pressure) is regulated **topside** by a bleed valve; two pressure "
-            "sensors bracket the umbilical so the line loss is measured, not "
-            "assumed."
+            "Two pumps feed a 1\" transport tube and then the umbilical down to "
+            "the ROV-mounted wash unit, whose rotating discs fire jets at the "
+            "hull. Flow (and so pressure) is regulated **topside** by a bleed "
+            "valve; two pressure sensors bracket the run so the total line "
+            "loss is measured, not assumed. The transport-tube length varies "
+            "between setups, which can shift the loss."
         )
         # Live flow/pressure chain through the system.
         _flow = scen.delivered_flow_lpm
@@ -113,8 +114,10 @@ if not compare_mode:
         T-JUNCTION  +  3-way BLEED VALVE ┘   ◀── regulate flow/pressure (bleed off excess)
          ⌖ [TOPSIDE pressure sensor]  ........  {_top:>4.0f} bar   (just after the valve)
                      │
-         UMBILICAL — 300 m, Ø123 mm, 1" supply hose,  × {scen.pressure_transmission_ratio:.2f} line loss (measured)
-                     │
+         TRANSPORT TUBE — 1" bore, T-junction → umbilical
+                     │                  (length varies by setup; adds line loss)
+         UMBILICAL — 300 m, Ø123 mm bundle, 1" supply hose inside
+                     │                  total topside→subsea × {scen.pressure_transmission_ratio:.2f} loss (measured)
         UMBILICAL ↔ ROV junction
          ⌖ [SUBSEA pressure sensor]  .........  {_sub:>4.0f} bar   (at the wash unit)
                      │
@@ -1320,8 +1323,14 @@ st.divider()
 with st.expander("Modelling assumptions and units"):
     st.markdown(
         """
-**Hull grid.** 1×1 cm cells. Each cell accumulates *integrated jet pressure
-exposure* in **bar·seconds**.
+**Hull grid.** The cell size is **auto-set from the footprint** (≈ footprint
+÷ 4, clamped 1–5 mm) so the jet disk is always well-resolved and the result
+does not depend on an arbitrary grid choice — a Nyquist-style sampling rule
+(the grid *and* the jet's per-step advance must be fine relative to the
+footprint, or the swept track aliases). A manual override is available in the
+sidebar with an under-resolution warning. Each cell accumulates *integrated
+jet-pressure exposure* in **bar·seconds** (a diagnostic; the cleaning gate
+itself uses the delivered impact measure, not bar·s).
 
 **Motion visualisation.** Shows an instantaneous snapshot at time `t`.
 Nozzle trails are the past `N` revolutions of each nozzle's trajectory
@@ -1361,12 +1370,22 @@ by `standoff · tan(cant)`.
 ROV travel direction. The ROV travel vector stays along +y in hull
 coordinates.
 
-**Steady-state core.** The first and last `array_span_y` mm of the
-simulated strip are entry/exit transients. Turn on the checkbox to
-exclude them from KPIs.
+**Steady-state core.** The entry transient (first `array_span_y` mm, array
+driving in) and the exit transient (last `array_span_y / 2` mm, trailing
+discs leaving) are excluded from the KPIs so only the fully-engaged plateau
+is scored.
 
-**Calibration tip.** Run a known operating point that produces a clean
-hull, read the median bar·s on the core region, and use that as your
-`clean_threshold` going forward.
+**Cleaning criterion.** The headline **Cleaned area** is *not* the bar·s
+exposure — it is a per-cell gate: the delivered **impact measure** (wall
+shear / stagnation / mean, selectable) must clear the fouling's removal
+threshold **and** the cell must get ≥ the minimum passes. The area splits
+into Cleaned / Partial / Untouched (sums to 100%). See the **System &
+impact** tab for the impact physics, the calibratable jet constants, and
+what a given fouling actually requires.
+
+**Calibration tip.** Calibrate the removal threshold (and the jet constants
+K, Cd, half-angle, Cf) against a run you *know* cleans your fouling — the
+delivered impact at your standoff is shown live in the sidebar and System
+tab. A single-jet firing test pins down the jet spread/core most directly.
         """
     )
