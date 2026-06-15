@@ -152,21 +152,32 @@ Hull strip
 
 ## Tabs
 
-As of `app_fast_v4.py` the app is organised into three tabs:
+The app is organised into four tabs, each with a *ℹ️ How to read this tab*
+expander at the top:
 
-1. **Impact simulation** — schematics plus the original "Run full
-   simulation" button. Results are cached in `st.session_state` so the
-   Hull tab can consume them.
+1. **Impact simulation** — the coverage sim: schematics, the "Run full
+   simulation" button, the Cleaned/Partial/Untouched split, the
+   passes & exposure heatmaps, and the single-disc gap check. Results are
+   cached so the Hull tab can consume them.
 2. **Motion simulation** — the Prepare/Play/Stop pre-rendered animation
    (hull or ROV frame, segment selector, stable-camera playback).
-3. **Hull simulation** — vessel-level cleaning time estimate. Inputs:
-   LOA, beam, draft, plus a visual midship-section selector (full
-   / typical / fine). Outputs: per-side wetted area, per-side time, and
-   total cleaning time. Needs a cached Impact result to run.
+3. **Hull simulation** — vessel-level cleaning time estimate from the
+   Impact-tab rate + hull geometry. Needs a cached Impact result.
+4. **System & impact** — the system model: operating point (exit velocity,
+   dynamic pressure, thrust), the three impact measures vs standoff, the
+   pressure-budget waterfall, and umbilical drag vs the MBL. Hosts the
+   *🎯 Calibration status* panel.
 
-The Hull tab derives its cleaning rate as
-`array_effective_width × ROV speed × coverage_fraction`, using the
-Impact-tab coverage KPI (fraction of cells above the clean threshold).
+## Calibration & assumed parameters
+
+Several jet constants are **assumed** handbook values (the biggest source of
+model uncertainty): discharge coeff Cd, far-field decay K, potential-core
+factor, jet half-angle, and wall skin-friction Cf. They are editable in the
+sidebar *Jet physics (calibratable ⚠ assumed)* expander and tagged ⚠ in the
+UI. The *Calibration status* panel (System tab) lists measured-vs-assumed and
+flags the highest-value next step: a **single-jet firing test** against
+pressure film / dye at known standoffs directly measures the real spread
+angle, core length and footprint — replacing K, half-angle and Cd.
 
 ## Hull geometry model
 

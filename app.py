@@ -63,10 +63,11 @@ st.set_page_config(
 
 st.title("FWU Coverage Simulator")
 st.caption(
-    "Simulates hull cleaning coverage from the rotating jet array. Cleaning "
-    "is decided by the jet **impact pressure at the hull** (in bar — how hard "
-    "it hits) plus the number of **passes** (how many times each spot is "
-    "struck). Adjust geometry, rotation, pressure and traverse speed, then run."
+    "Simulates hull cleaning from the rotating jet array. Cleaning needs "
+    "enough **impact at the hull** (the chosen measure — wall shear, "
+    "stagnation or mean pressure — set in the sidebar) **plus** enough "
+    "**passes**. **New here?** Open the *ℹ️ How to read this tab* panel at the "
+    "top of each tab, and the *🎯 Calibration status* in the System tab."
 )
 
 # -----------------------------------------------------------------------------
@@ -92,6 +93,25 @@ if not compare_mode:
     # TAB 1 — Impact simulation
     # =============================================================
     with tab_impact:
+        with st.expander("ℹ️ How to read this tab"):
+            st.markdown(
+                "The **coverage simulation**: where the rotating jet array "
+                "sweeps the hull, and how much of it gets cleaned.\n\n"
+                "1. Set the array geometry, operating point and cleaning "
+                "criterion in the **sidebar**, then click **Run full "
+                "simulation**.\n"
+                "2. **Cleaned / Partial / Untouched** split the swept area "
+                "(they sum to 100%): *cleaned* = enough impact AND enough "
+                "passes; *partial* = struck but under-gated; *untouched* = "
+                "never struck.\n"
+                "3. The **impact-pressure box** is how *hard* the jet hits "
+                "(its own units); the **two heatmaps** show passes/cell and "
+                "accumulated exposure (the lattice = disc overlap).\n"
+                "4. **Single-disc coverage** below shows whether one disc's "
+                "rings overlap or leave gaps.\n\n"
+                "Grid resolution is auto-set from the footprint (Nyquist) so "
+                "the result doesn't depend on the grid — see the sidebar.")
+
         # Row 1 — the short schematics, balanced heights.
         col_top, col_side, col_spray = st.columns(3)
         with col_top:
@@ -200,6 +220,18 @@ if not compare_mode:
     # TAB 2 — Motion simulation
     # =============================================================
     with tab_motion:
+        with st.expander("ℹ️ How to read this tab"):
+            st.markdown(
+                "An **animation** of the jets sweeping the hull — a visual "
+                "sanity check on the geometry, not a new calculation.\n\n"
+                "- **Prepare** pre-renders the frames, then **Play** scrubs "
+                "through the traversal; the slider jumps to any time.\n"
+                "- *Hull frame* shows the cycloid trails as the array "
+                "advances; *ROV frame* factors out the translation so the "
+                "nozzle paths look like pure rosettes.\n"
+                "- The optional **cumulative underlay** overlays the bar·s "
+                "exposure built up so far.")
+
         rov_speed_mm_s = scen.rov_speed_kn * KNOTS_TO_MPS * 1000.0
         total_time_s = scen.sim_length_mm / max(rov_speed_mm_s, 1e-6)
         total_ms = int(total_time_s * 1000)
@@ -541,6 +573,19 @@ if not compare_mode:
     # TAB 3 — Hull simulation
     # =============================================================
     with tab_hull:
+        with st.expander("ℹ️ How to read this tab"):
+            st.markdown(
+                "Scales the **per-strip cleaning rate** from the Impact tab "
+                "up to a **whole-vessel cleaning time**.\n\n"
+                "1. **Run the Impact simulation first** — this tab reads its "
+                "cleaned-area rate.\n"
+                "2. Enter the vessel particulars (LOA, beam, draft) and pick "
+                "a hull-shape preset; it estimates the wetted area per side + "
+                "bottom.\n"
+                "3. Output: per-side and total cleaning time. It ignores bow/"
+                "stern/appendages and docking/transit overhead — apply a "
+                "1.3–1.6× multiplier for real quotes.")
+
         st.subheader("Vessel-level cleaning time estimate")
         st.caption(
             "Given the Impact-tab cleaning-rate and a hull geometry, "
@@ -742,6 +787,24 @@ if not compare_mode:
     # TAB 4 — System & impact
     # =============================================================
     with tab_system:
+        with st.expander("ℹ️ How to read this tab"):
+            st.markdown(
+                "This tab is the **system model**: it computes what the jet "
+                "does to the hull from the pump flow, and shows the operating "
+                "constraints — independent of *where* the array sweeps (that "
+                "is the Impact tab).\n\n"
+                "- **Operating point** — exit velocity, dynamic pressure, and "
+                "the thrust the ROV must hold against.\n"
+                "- **Impact vs standoff** — the three candidate cleaning "
+                "measures as the jet decays. Standoff is the dominant lever "
+                "(~90% of impact gone by 25 mm).\n"
+                "- **Operational constraints** — the pressure budget down the "
+                "umbilical and the umbilical drag, which is the real binding "
+                "limit near 2–3 kn.\n\n"
+                "Many jet constants (K, Cd, half-angle, Cf) are **assumed** — "
+                "see the Calibration status below and the sidebar *Jet "
+                "physics* expander.")
+
         st.subheader("Jet impact at the hull")
         st.caption(
             "What the jet actually does to the hull, from first principles: "
@@ -749,6 +812,28 @@ if not compare_mode:
             "decay over the standoff → impact. Three measures are shown "
             "because the cleaning mechanism is not yet confirmed; pick which "
             "one gates cleaning in the sidebar.")
+
+        # --- Calibration status -------------------------------------------
+        with st.expander("🎯 Calibration status — measured vs assumed", expanded=False):
+            st.markdown(
+                "**✓ Measured / specified** (trust these):\n"
+                f"- Total flow {scen.total_flow_lpm:.0f} L/min, "
+                f"{scen.n_nozzles_total} × {scen.nozzle_exit_mm:.2f} mm bore "
+                f"nozzles, {scen.rpm} rpm, water density "
+                f"{scen.water_density:.0f} kg/m³.\n\n"
+                "**⚠ Assumed — handbook values, the main uncertainty:**\n"
+                f"- Discharge coeff Cd = {scen.nozzle_cd:.2f} (derived — verify)\n"
+                f"- Far-field decay K = {scen.decay_K:.1f}\n"
+                f"- Potential core = {scen.core_factor:.1f} × exit dia "
+                f"(= {scen.core_length_mm:.1f} mm)\n"
+                f"- Jet half-angle = {scen.jet_half_angle_deg:.0f}°\n"
+                f"- Wall skin-friction Cf = {scen.skin_friction_cf:.4f}\n\n"
+                "**📋 Measure first (highest value):** a single-jet firing "
+                "test against pressure film / dye-in-water at known standoffs "
+                "directly gives the **real spread angle, core length and "
+                "footprint** — replacing K, half-angle and Cd, which is where "
+                "most of the model uncertainty sits. Edit any of these in the "
+                "sidebar *Jet physics (calibratable)* expander.")
 
         # --- Operating point ----------------------------------------------
         o1, o2, o3, o4 = st.columns(4)
