@@ -89,53 +89,85 @@ class Scenario:
         """Total nozzles in the array = discs × nozzles per disc."""
         return (self.n_row1 + self.n_row2) * self.n_nozzles
 
-    @property
-    def flow_per_nozzle_lpm(self) -> float:
-        """Commanded pump flow divided across every nozzle (L/min)."""
-        return self.total_flow_lpm / max(self.n_nozzles_total, 1)
-
-    # ---- Jet exit state (flow-controlled: pump flow → velocity → pressure) --
+    # ---- Jet exit state (flow-controlled, clamped by both ceilings) --------
     @property
     def nozzle_exit_area_m2(self) -> float:
         d = self.nozzle_exit_mm / 1000.0
         return math.pi * (d / 2.0) ** 2
 
     @property
+    def hose_allowed_flow_lpm(self) -> float:
+        """
+        Max total flow the hose/relief ceiling permits: the topside cannot
+        exceed the ceiling, so the nozzle pressure ≤ ceiling × ratio, which
+        bounds the velocity v = Cd·√(2·P/ρ) and hence the flow v·A·n.
+        """
+        p_subsea_max = self.hose_pressure_ceiling_bar \
+            * self.pressure_transmission_ratio
+        v_max = self.nozzle_cd * math.sqrt(
+            2.0 * max(p_subsea_max, 0.0) * 1e5 / max(self.water_density, 1e-6))
+        q_m3s = v_max * self.nozzle_exit_area_m2 * self.n_nozzles_total
+        return q_m3s * 1000.0 * 60.0
+
+    @property
+    def delivered_flow_lpm(self) -> float:
+        """
+        Flow actually delivered = commanded, clamped by BOTH ceilings: the
+        pump capacity AND the hose-allowed flow (the relief bypasses excess).
+        This is what the jet and the sim actually run on.
+        """
+        return min(self.total_flow_lpm, self.pump_flow_cap_lpm,
+                   self.hose_allowed_flow_lpm)
+
+    @property
+    def flow_per_nozzle_lpm(self) -> float:
+        """Delivered flow per nozzle (L/min)."""
+        return self.delivered_flow_lpm / max(self.n_nozzles_total, 1)
+
+    @property
     def jet_exit_velocity(self) -> float:
-        """Exit velocity v = Q/A per nozzle (m/s). Flow is the input."""
+        """Exit velocity v = Q/A per nozzle (m/s), from the DELIVERED flow."""
         q_m3s = self.flow_per_nozzle_lpm / 1000.0 / 60.0
         return q_m3s / max(self.nozzle_exit_area_m2, 1e-12)
 
     @property
     def subsea_pressure_bar(self) -> float:
-        """
-        Nozzle (subsea) pressure that RESULTS from the flow: ½ρ(v/Cd)². This
-        is the pressure needed at the manifold to push the commanded flow
-        through the nozzles — a consequence, not an input.
-        """
+        """Nozzle (subsea) pressure from the delivered flow: ½ρ(v/Cd)²."""
         v = self.jet_exit_velocity
         return 0.5 * self.water_density * (v / max(self.nozzle_cd, 1e-6)) ** 2 / 1e5
 
     @property
     def topside_pressure_bar(self) -> float:
-        """
-        Topside (pump-side) pressure the flow implies = subsea ÷ transmission
-        ratio (the umbilical loss works back up from the nozzle demand).
-        """
+        """Topside pressure the delivered flow needs = subsea ÷ transmission."""
         return self.subsea_pressure_bar / max(self.pressure_transmission_ratio,
                                                1e-6)
 
     @property
+    def limiting_ceiling(self) -> str:
+        """Which ceiling binds the delivered flow: 'pump flow', 'hose
+        pressure', or 'none' (commanded flow is below both)."""
+        cmd = self.total_flow_lpm
+        if self.delivered_flow_lpm >= cmd - 1e-6:
+            return "none"
+        # Whichever ceiling is the lower one is the binding constraint.
+        return ("hose pressure"
+                if self.hose_allowed_flow_lpm < self.pump_flow_cap_lpm
+                else "pump flow")
+
+    @property
+    def flow_throttled(self) -> bool:
+        """True when a ceiling clamped delivered flow below commanded."""
+        return self.delivered_flow_lpm < self.total_flow_lpm - 1e-6
+
+    @property
     def at_flow_cap(self) -> bool:
-        """True when commanded flow is at (or above) the pump capacity."""
-        return self.total_flow_lpm >= self.pump_flow_cap_lpm - 1e-6
+        """True when the delivered flow is at the pump capacity."""
+        return self.delivered_flow_lpm >= self.pump_flow_cap_lpm - 1e-6
 
     @property
     def pressure_ceiling_exceeded(self) -> bool:
-        """The one real pressure limit: if the topside the flow demands exceeds
-        the hose/relief ceiling, the relief bypasses and full flow can't be
-        delivered."""
-        return self.topside_pressure_bar > self.hose_pressure_ceiling_bar
+        """Kept for back-compat: the hose ceiling is the binding limit."""
+        return self.limiting_ceiling == "hose pressure"
 
     @property
     def pressure_bar(self) -> float:
@@ -198,6 +230,55 @@ class Scenario:
         if self.cleaning_measure.startswith("Mean"):
             return self.mean_impact_pressure_bar(standoff_mm)
         return self.wall_shear_kpa(standoff_mm)
+
+    # ---- Backward analysis: what does cleaning the fouling REQUIRE? ---------
+    # The real operating target is the impact at the hull. Work back from a
+    # required intensity (the fouling's removal threshold) through the jet
+    # decay to the subsea/topside pressure the operator must regulate to.
+    def _decay_factor(self, standoff_mm: float | None = None) -> float:
+        x = (self.standoff_mm if standoff_mm is None else standoff_mm)
+        x = x / max(math.cos(math.radians(self.nozzle_cant_deg)), 1e-6)
+        core = self.core_length_mm
+        return 1.0 if x <= core else self.decay_K * self.nozzle_exit_mm / x
+
+    def required_subsea_pressure_bar(self, intensity: float | None = None,
+                                     standoff_mm: float | None = None) -> float:
+        """
+        Subsea (nozzle) pressure needed so the chosen impact measure reaches
+        `intensity` at the hull (default: the removal threshold). Inverts
+        measure → v_c → v_exit → ½ρ(v_exit/Cd)². Mean-pressure can't be
+        cleanly inverted (footprint-dependent); approximated via stagnation.
+        """
+        target = self.removal_pressure_bar if intensity is None else intensity
+        rho = self.water_density
+        if self.cleaning_measure.startswith("Wall"):
+            v_c = math.sqrt(target * 1000.0 / (self.skin_friction_cf * 0.5 * rho))
+        else:  # stagnation (and mean, approximated): ½ρv_c² = target bar
+            v_c = math.sqrt(target * 1e5 / (0.5 * rho))
+        decay = max(self._decay_factor(standoff_mm), 1e-6)
+        v_exit = v_c / decay
+        return 0.5 * rho * (v_exit / max(self.nozzle_cd, 1e-6)) ** 2 / 1e5
+
+    def required_topside_pressure_bar(self, intensity: float | None = None,
+                                      standoff_mm: float | None = None) -> float:
+        """Topside the operator must regulate to = required subsea ÷ ratio."""
+        return self.required_subsea_pressure_bar(intensity, standoff_mm) \
+            / max(self.pressure_transmission_ratio, 1e-6)
+
+    @property
+    def max_subsea_pressure_bar(self) -> float:
+        """
+        Highest subsea pressure reachable at the CURRENT nozzle count, limited
+        by whichever binds first: the pumps (all flow through n nozzles) or the
+        hose ceiling. Fewer nozzles raises the pump-limited value.
+        """
+        # Pump-limited: full pump flow through n nozzles.
+        q = self.pump_flow_cap_lpm / 1000.0 / 60.0
+        v_pump = q / max(self.nozzle_exit_area_m2 * self.n_nozzles_total, 1e-12)
+        p_pump = 0.5 * self.water_density * (v_pump / max(self.nozzle_cd, 1e-6)) ** 2 / 1e5
+        # Hose-limited: topside ≤ ceiling → subsea ≤ ceiling × ratio.
+        p_hose = self.hose_pressure_ceiling_bar * self.pressure_transmission_ratio
+        return min(p_pump, p_hose)
 
     def footprint_dia(self, standoff_mm: float | None = None) -> float:
         if self.footprint_mode == "Manual override":
