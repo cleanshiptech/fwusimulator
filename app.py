@@ -93,6 +93,68 @@ if not compare_mode:
     # TAB 0 — Overview (how it all fits together)
     # =============================================================
     with tab_overview:
+        # ---- The system as it is today -----------------------------------
+        st.subheader("The system as it is today")
+        st.markdown(
+            "Two pumps feed one umbilical down to the ROV-mounted wash unit, "
+            "whose rotating discs fire jets at the hull. Flow (and so "
+            "pressure) is regulated **topside** by a bleed valve; two pressure "
+            "sensors bracket the umbilical so the line loss is measured, not "
+            "assumed."
+        )
+        # Live flow/pressure chain through the system.
+        _flow = scen.delivered_flow_lpm
+        _sub = scen.subsea_pressure_bar
+        _top = scen.topside_pressure_bar
+        st.code(
+            f"""  Pump 1  (DEN-JET CE100-300, 135 L/min) ┐
+  Pump 2  (DEN-JET CE100-300, 135 L/min) ┤   combined ≤ {scen.pump_flow_cap_lpm:.0f} L/min (4.5 L/s)
+                                         │
+        T-JUNCTION  +  3-way BLEED VALVE ┘   ◀── regulate flow/pressure (bleed off excess)
+         ⌖ [TOPSIDE pressure sensor]  ........  {_top:>4.0f} bar   (just after the valve)
+                     │
+         UMBILICAL — 300 m, Ø123 mm, 1" supply hose,  × {scen.pressure_transmission_ratio:.2f} line loss (measured)
+                     │
+        UMBILICAL ↔ ROV junction
+         ⌖ [SUBSEA pressure sensor]  .........  {_sub:>4.0f} bar   (at the wash unit)
+                     │
+         WASH UNIT — {scen.n_row1 + scen.n_row2} discs × {scen.n_nozzles} = {scen.n_nozzles_total} nozzles, """
+            f"""{scen.nozzle_exit_mm:.2f} mm bore, {scen.rpm} rpm, {_flow:.0f} L/min
+                     ▼
+         JETS → HULL   (standoff {scen.standoff_mm} mm, ROV {scen.rov_speed_kn:.1f} kn)""",
+            language=None)
+
+        sd_c1, sd_c2 = st.columns(2)
+        with sd_c1:
+            st.markdown("**Standard settings (this scenario)**")
+            st.markdown(
+                f"| | |\n|---|---|\n"
+                f"| Pump flow | {_flow:.0f} L/min ({_flow / 60:.1f} L/s) |\n"
+                f"| Topside pressure | {_top:.0f} bar |\n"
+                f"| Subsea pressure | {_sub:.0f} bar |\n"
+                f"| Nozzles | {scen.n_nozzles_total} × {scen.nozzle_exit_mm:.2f} mm |\n"
+                f"| Disc rotation | {scen.rpm} rpm |\n"
+                f"| Standoff | {scen.standoff_mm} mm |\n"
+                f"| ROV speed | {scen.rov_speed_kn:.1f} kn |")
+        with sd_c2:
+            st.markdown("**Limits / ceilings**")
+            st.markdown(
+                f"| | |\n|---|---|\n"
+                f"| Pump flow cap | {scen.pump_flow_cap_lpm:.0f} L/min |\n"
+                f"| Hose pressure (WP) | {scen.hose_pressure_ceiling_bar:.0f} bar topside |\n"
+                f"| Umbilical MBL | 60 kN (drag-limited ~2–3 kn) |\n"
+                f"| Max subsea reachable | {scen.max_subsea_pressure_bar:.0f} bar |\n"
+                f"| Transmission (meas.) | ×{scen.pressure_transmission_ratio:.2f} |")
+        st.caption(
+            "You operate near both ceilings at once: ~"
+            f"{100 * _flow / max(scen.pump_flow_cap_lpm, 1):.0f}% of pump flow "
+            f"and ~{100 * _top / scen.hose_pressure_ceiling_bar:.0f}% of the "
+            "hose pressure rating. So loss reduction (bore, dual lines, hose "
+            "rating) — not pump pressure — is the path to more impact. The "
+            "System & impact tab quantifies all of this.")
+
+        st.divider()
+
         st.subheader("How this system cleans — the whole picture")
         st.markdown(
             "A patch of hull is cleaned when it gets **enough impact** (the "
