@@ -112,14 +112,13 @@ if not compare_mode:
   Pump 2  (DEN-JET CE100-300, 135 L/min) ┤   combined ≤ {scen.pump_flow_cap_lpm:.0f} L/min (4.5 L/s)
                                          │
         T-JUNCTION  +  3-way BLEED VALVE ┘   ◀── regulate flow/pressure (bleed off excess)
-         ⌖ [TOPSIDE pressure sensor]  ........  {_top:>4.0f} bar   (just after the valve)
+         ⌖ [TOPSIDE pressure sensor]  ........  {_top:>4.0f} bar   (here, at the T-junction)
                      │
-         TRANSPORT TUBE — 1" bore, T-junction → umbilical
-                     │                  (length varies by setup; adds line loss)
+         1" TRANSPORT TUBE  (length varies by setup; adds line loss)
+                     │
          UMBILICAL — 300 m, Ø123 mm bundle, 1" supply hose inside
                      │                  total topside→subsea × {scen.pressure_transmission_ratio:.2f} loss (measured)
-        UMBILICAL ↔ ROV junction
-         ⌖ [SUBSEA pressure sensor]  .........  {_sub:>4.0f} bar   (at the wash unit)
+         ⌖ [SUBSEA pressure sensor]  .........  {_sub:>4.0f} bar   (at the ROV / wash unit)
                      │
          WASH UNIT — {scen.n_row1 + scen.n_row2} discs × {scen.n_nozzles} = {scen.n_nozzles_total} nozzles, """
             f"""{scen.nozzle_exit_mm:.2f} mm bore, {scen.rpm} rpm, {_flow:.0f} L/min
