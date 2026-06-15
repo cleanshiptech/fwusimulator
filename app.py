@@ -983,6 +983,64 @@ if not compare_mode:
 
         st.divider()
 
+        # --- What cleaning requires (backward from the hull target) -------
+        st.subheader("What cleaning this fouling requires")
+        _unit = "kPa" if scen.cleaning_measure.startswith("Wall") else "bar"
+        _req_subsea = scen.required_subsea_pressure_bar()
+        _req_topside = scen.required_topside_pressure_bar()
+        _max_subsea = scen.max_subsea_pressure_bar
+        _reachable = _req_topside <= scen.hose_pressure_ceiling_bar + 1e-6 \
+            and _req_subsea <= _max_subsea + 1e-6
+        st.caption(
+            "Your real target is the **impact at the hull**. Working back from "
+            f"the **{scen.removal_pressure_bar:.1f} {_unit}** removal "
+            f"threshold ({scen.cleaning_measure.lower()}) at "
+            f"{scen.standoff_mm} mm standoff:")
+        r1, r2, r3 = st.columns(3)
+        r1.metric("Subsea pressure needed", f"{_req_subsea:.0f} bar",
+                  help="Regulate the subsea (cleaning) pressure to about this "
+                       "to just clear the fouling at your standoff.")
+        r2.metric("Topside to dial", f"{_req_topside:.0f} bar",
+                  delta=("over hose ceiling"
+                         if _req_topside > scen.hose_pressure_ceiling_bar
+                         else f"of {scen.hose_pressure_ceiling_bar:.0f} ceiling"),
+                  delta_color="inverse"
+                  if _req_topside > scen.hose_pressure_ceiling_bar else "off",
+                  help="= subsea ÷ transmission ratio. What the topside gauge "
+                       "should read.")
+        r3.metric("Max reachable subsea", f"{_max_subsea:.0f} bar",
+                  help=f"Highest subsea pressure your {scen.n_nozzles_total} "
+                       "nozzles can reach (limited by pumps or the hose).")
+        if _reachable:
+            st.success(
+                f"✅ **Reachable.** Regulate the subsea pressure up to "
+                f"~{_req_subsea:.0f} bar (topside ~{_req_topside:.0f} bar) and "
+                "the fouling clears at this standoff. You have headroom to "
+                f"{_max_subsea:.0f} bar subsea.")
+        else:
+            # Diagnose: is the hose the limit, and would blanking help?
+            _hose_caps = (scen.hose_pressure_ceiling_bar
+                          * scen.pressure_transmission_ratio) <= _max_subsea + 1e-6
+            st.warning(
+                f"⚠ **Not reachable** at this config: cleaning needs "
+                f"~{_req_subsea:.0f} bar subsea but you can only reach "
+                f"~{_max_subsea:.0f} bar. "
+                + ("The **hose ceiling** is the limit — blanking discs will "
+                   "NOT help (max reachable is the same with fewer nozzles); "
+                   "you need a higher-rated hose, lower umbilical loss, or a "
+                   "shorter standoff."
+                   if _hose_caps else
+                   "You're **pump-flow limited** — **blanking discs would "
+                   "help** (fewer nozzles let the same pump flow reach a "
+                   "higher pressure), until the hose ceiling binds."))
+        st.caption(
+            "This is the loop closed: the cleaning gate (hull impact) → the "
+            "subsea pressure to regulate to → the topside to dial → whether "
+            "your hardware can reach it. Shorter standoff is the cheapest "
+            "lever (impact rises fast as you approach the jet core).")
+
+        st.divider()
+
         # --- Operational constraints sub-section --------------------------
         st.subheader("Operational constraints")
         st.caption(
@@ -1023,38 +1081,48 @@ if not compare_mode:
             "was largely this proportional loss. Real scatter means it ranges "
             "around this line.")
 
-        # Flow → velocity → pressure (all consequences of the commanded flow).
+        # Delivered flow → velocity, with the limiting ceiling.
         fl1, fl2, fl3 = st.columns(3)
-        fl1.metric("Commanded flow", f"{scen.total_flow_lpm:.0f} L/min",
-                   help=f"What you set; cap {scen.pump_flow_cap_lpm:.0f} "
-                        "L/min. Velocity follows as Q/A.")
+        _cmd, _del = scen.total_flow_lpm, scen.delivered_flow_lpm
+        fl1.metric("Delivered flow", f"{_del:.0f} L/min",
+                   delta=(f"−{_cmd - _del:.0f} throttled"
+                          if scen.flow_throttled else None),
+                   delta_color="inverse",
+                   help=f"Commanded {_cmd:.0f}, clamped by the pump cap "
+                        f"({scen.pump_flow_cap_lpm:.0f}) and the hose ceiling "
+                        f"({scen.hose_allowed_flow_lpm:.0f}).")
         fl2.metric("Exit velocity", f"{scen.jet_exit_velocity:.0f} m/s",
-                   help="v = Q/A per nozzle — flow-driven.")
-        fl3.metric("Pump usage",
-                   f"{100 * scen.total_flow_lpm / max(scen.pump_flow_cap_lpm, 1):.0f} %",
-                   help="Commanded flow as a fraction of the pump capacity.")
+                   help="v = Q/A per nozzle on the DELIVERED flow.")
+        fl3.metric("Limiting ceiling",
+                   {"none": "—", "pump flow": "Pump flow",
+                    "hose pressure": "Hose pressure"}[scen.limiting_ceiling],
+                   help="Which constraint binds the delivered flow.")
         # Design-point note: full pump flow ↔ the resulting nozzle pressure.
         _A_n = scen.nozzle_exit_area_m2 * scen.n_nozzles_total
         _v_full = (scen.pump_flow_cap_lpm / 1000.0 / 60.0) / max(_A_n, 1e-12)
         _p_full = 0.5 * scen.water_density \
             * (_v_full / max(scen.nozzle_cd, 1e-6)) ** 2 / 1e5
         st.caption(
-            f"Your nozzle area is matched to the pumps: **full flow "
-            f"({scen.pump_flow_cap_lpm:.0f} L/min) → ~{_p_full:.0f} bar at the "
-            f"nozzle** through {scen.n_nozzles_total} × "
-            f"{scen.nozzle_exit_mm:.2f} mm. That is the design point — the "
-            "bore is sized so full pump flow produces the working pressure.")
-        if scen.at_flow_cap:
-            st.info(
-                "ℹ️ **At the pump flow cap** — you can't push more flow "
-                "(hence velocity/impact) without changing the nozzles or "
-                "adding pump capacity.")
-        if scen.pressure_ceiling_exceeded:
+            f"Design point: **full pump flow ({scen.pump_flow_cap_lpm:.0f} "
+            f"L/min) → ~{_p_full:.0f} bar at the nozzle** through "
+            f"{scen.n_nozzles_total} × {scen.nozzle_exit_mm:.2f} mm — the bore "
+            "is sized to the pump capacity. The hose ceiling allows up to "
+            f"**{scen.hose_allowed_flow_lpm:.0f} L/min** at this nozzle count.")
+        if scen.limiting_ceiling == "hose pressure":
             st.warning(
-                f"⚠ This flow needs **{scen.topside_pressure_bar:.0f} bar "
-                f"topside**, above the {scen.hose_pressure_ceiling_bar:.0f} "
-                "bar hose/relief ceiling — the relief would bypass and full "
-                "flow can't be delivered. (The one real *pressure* limit.)")
+                f"⚠ **Hose-pressure limited.** Delivered flow is throttled to "
+                f"{_del:.0f} L/min — the topside the flow wants exceeds the "
+                f"{scen.hose_pressure_ceiling_bar:.0f} bar hose/relief ceiling, "
+                "so the relief bypasses. **Blanking discs/nozzles will NOT "
+                "raise per-nozzle impact** in this regime (you're not "
+                "flow-limited) — it narrows the swath at the same intensity. "
+                "Raise impact via a wider bore, lower umbilical loss, or a "
+                "higher-rated hose.")
+        elif scen.limiting_ceiling == "pump flow":
+            st.info(
+                f"ℹ️ **Pump-flow limited** at {_del:.0f} L/min. Here blanking "
+                "nozzles *would* raise per-nozzle impact (same flow, fewer "
+                "jets) — until the hose ceiling binds.")
 
         # Umbilical drag vs ROV speed, with MBL and a fairing toggle.
         st.markdown("**Umbilical drag vs ROV speed**")

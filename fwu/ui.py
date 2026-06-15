@@ -94,20 +94,17 @@ def scenario_controls(prefix: str, defaults: Scenario, container) -> Scenario:
              "(SSO3 + one other, Mar 2023–Mar 2025) — a ~43% umbilical line "
              "loss. Used to work the required topside back up from the nozzle "
              "demand.")
-    # Show the flow → velocity → pressure chain (all consequences of flow).
-    _cap_note = " ⚠ at pump cap" if s.at_flow_cap else ""
+    # Flow → velocity → pressure chain. (In the real rig the bleed valve
+    # regulates to a target subsea pressure; here flow is the proxy input and
+    # pressure follows. The System tab works backward from the cleaning target.)
     container.caption(
-        f"→ {s.total_flow_lpm:.0f} L/min{_cap_note} through "
-        f"{s.n_nozzles_total} × {s.nozzle_exit_mm:.2f} mm → exit velocity "
+        f"→ {s.delivered_flow_lpm:.0f} L/min to {s.n_nozzles_total} nozzles "
+        f"× {s.nozzle_exit_mm:.2f} mm → exit velocity "
         f"**{s.jet_exit_velocity:.0f} m/s** (v = Q/A) → nozzle "
         f"**{s.subsea_pressure_bar:.0f} bar** → topside "
-        f"**{s.topside_pressure_bar:.0f} bar** (÷ {s.pressure_transmission_ratio:.2f}).")
-    if s.pressure_ceiling_exceeded:
-        container.warning(
-            f"⚠ Required topside {s.topside_pressure_bar:.0f} bar exceeds the "
-            f"{s.hose_pressure_ceiling_bar:.0f} bar hose/relief ceiling — the "
-            "relief would bypass, so this flow can't actually be delivered. "
-            "Reduce flow, widen the bore, or reduce the umbilical loss.")
+        f"**{s.topside_pressure_bar:.0f} bar** (÷ "
+        f"{s.pressure_transmission_ratio:.2f}). See **System & impact** for "
+        "what cleaning your fouling actually requires.")
 
     container.subheader("Jet footprint model")
     _fp_modes = [
