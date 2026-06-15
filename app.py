@@ -1320,8 +1320,14 @@ st.divider()
 with st.expander("Modelling assumptions and units"):
     st.markdown(
         """
-**Hull grid.** 1×1 cm cells. Each cell accumulates *integrated jet pressure
-exposure* in **bar·seconds**.
+**Hull grid.** The cell size is **auto-set from the footprint** (≈ footprint
+÷ 4, clamped 1–5 mm) so the jet disk is always well-resolved and the result
+does not depend on an arbitrary grid choice — a Nyquist-style sampling rule
+(the grid *and* the jet's per-step advance must be fine relative to the
+footprint, or the swept track aliases). A manual override is available in the
+sidebar with an under-resolution warning. Each cell accumulates *integrated
+jet-pressure exposure* in **bar·seconds** (a diagnostic; the cleaning gate
+itself uses the delivered impact measure, not bar·s).
 
 **Motion visualisation.** Shows an instantaneous snapshot at time `t`.
 Nozzle trails are the past `N` revolutions of each nozzle's trajectory
@@ -1361,12 +1367,22 @@ by `standoff · tan(cant)`.
 ROV travel direction. The ROV travel vector stays along +y in hull
 coordinates.
 
-**Steady-state core.** The first and last `array_span_y` mm of the
-simulated strip are entry/exit transients. Turn on the checkbox to
-exclude them from KPIs.
+**Steady-state core.** The entry transient (first `array_span_y` mm, array
+driving in) and the exit transient (last `array_span_y / 2` mm, trailing
+discs leaving) are excluded from the KPIs so only the fully-engaged plateau
+is scored.
 
-**Calibration tip.** Run a known operating point that produces a clean
-hull, read the median bar·s on the core region, and use that as your
-`clean_threshold` going forward.
+**Cleaning criterion.** The headline **Cleaned area** is *not* the bar·s
+exposure — it is a per-cell gate: the delivered **impact measure** (wall
+shear / stagnation / mean, selectable) must clear the fouling's removal
+threshold **and** the cell must get ≥ the minimum passes. The area splits
+into Cleaned / Partial / Untouched (sums to 100%). See the **System &
+impact** tab for the impact physics, the calibratable jet constants, and
+what a given fouling actually requires.
+
+**Calibration tip.** Calibrate the removal threshold (and the jet constants
+K, Cd, half-angle, Cf) against a run you *know* cleans your fouling — the
+delivered impact at your standoff is shown live in the sidebar and System
+tab. A single-jet firing test pins down the jet spread/core most directly.
         """
     )
