@@ -179,6 +179,25 @@ flags the highest-value next step: a **single-jet firing test** against
 pressure film / dye at known standoffs directly measures the real spread
 angle, core length and footprint — replacing K, half-angle and Cd.
 
+## Fouling removal thresholds — two regimes
+
+The removal thresholds are set in the **hydrodynamic-cleaning** regime, not
+the static **adhesion-bond** regime — they differ by ~100× and describe
+different mechanisms:
+
+- **Hydrodynamic removal** (the protruding organism / soft fouling): soft
+  biofouling detaches at **0.01–0.28 kPa** wall shear; practical in-water
+  cleaning runs **≤ ~1.3 kPa** wall shear / ~1.7 bar stagnation without
+  coating damage. The cleaning gate uses these.
+- **Adhesion bond** (the flat cemented barnacle base): **17–55 kPa** on
+  silicone foul-release coatings (Kim et al. 2008) up to **0.5–2 MPa** on a
+  hard substrate (ASTM/FIT shear-adhesion test).
+
+This is why a jet **removes a barnacle's body but leaves its base**: the
+body is cleared hydrodynamically (low threshold), while the base needs the
+full bond strength — far above what the jet's *mean* load over the base
+delivers on a hard hull. The two-tier comparison is in the System tab.
+
 ## Hull geometry model
 
 Midship cross-section is parametrised by:

@@ -1039,6 +1039,38 @@ if not compare_mode:
             "your hardware can reach it. Shorter standoff is the cheapest "
             "lever (impact rises fast as you approach the jet core).")
 
+        # --- Two-tier: hydrodynamic removal vs adhesion bond --------------
+        with st.expander(
+                "🦠 Fouling thresholds — hydrodynamic removal vs adhesion bond"):
+            _shear = scen.wall_shear_kpa()
+            _stag_kpa = scen.stagnation_pressure_bar() * 100.0
+            st.markdown(
+                "Two **different mechanisms** set how hard fouling is to "
+                "remove — and your jet sits between them, which is why a "
+                "barnacle's **body comes off but its base stays**:\n\n"
+                "**1. Hydrodynamic removal** (the body / soft fouling) — the "
+                "flow's shear + stagnation lift and lever the *protruding* "
+                "organism off. Low thresholds:\n"
+                "- Soft biofouling removed at **0.01–0.28 kPa** wall shear "
+                "(microalgae, sporelings).\n"
+                "- Practical in-water cleaning runs **≤ ~1.3 kPa** wall shear "
+                "/ ~1.7 bar stagnation without coating damage.\n"
+                f"- *Your jet delivers ~{_shear:.1f} kPa shear* → clears the "
+                "body comfortably.\n\n"
+                "**2. Adhesion bond** (the cemented base plate) — flat, no "
+                "leverage, so removal needs the full bond strength:\n"
+                "- Barnacle base on **silicone foul-release: 17–55 kPa** "
+                "(Kim et al. 2008).\n"
+                "- Barnacle base on a **hard substrate (steel/epoxy): "
+                "0.5–2 MPa = 500–2000 kPa** (ASTM/FIT shear-adhesion test).\n"
+                f"- *Your jet's peak stagnation is ~{_stag_kpa:.0f} kPa at the "
+                "centreline, but the **mean** over the whole base is far less* "
+                "→ on a hard hull the base survives.\n\n"
+                "**So:** the cleaning gate above uses the *hydrodynamic* "
+                "thresholds (what removes the body). Getting the **base** off "
+                "a hard hull needs ~100× more and is bond-limited — a "
+                "mechanical/standoff problem, not a pressure one.")
+
         st.divider()
 
         # --- Operational constraints sub-section --------------------------

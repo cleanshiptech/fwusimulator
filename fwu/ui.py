@@ -201,30 +201,41 @@ def scenario_controls(prefix: str, defaults: Scenario, container) -> Scenario:
              "Impact tab.")
     _unit = "kPa" if s.cleaning_measure.startswith("Wall") else "bar"
     # Per-measure fouling presets (typical removal thresholds, calibratable).
+    # Literature-grounded removal thresholds (hydrodynamic CLEANING regime,
+    # NOT the static adhesion-bond strength — those differ by ~100×):
+    #  • Wall shear: soft biofouling removed at 10–280 Pa; practical in-water
+    #    cleaning runs up to ~1.3 kPa wall shear (Tribou & Swain; Oliveira &
+    #    Granhag). So soft ~0.05, weed ~0.3, hard ~1.0 kPa.
+    #  • Stagnation: a non-damaging cleaning jet is ~0.17 MPa ≈ 1.7 bar;
+    #    barnacle adhesion 0.03–2 MPa sets the hard end.
     _presets = {
-        "Wall shear stress": {"Soft biofilm / slime": 6.0,
-                              "Light weed / early growth": 15.0,
-                              "Hard calcareous / barnacle": 30.0, "Custom": None},
-        "Stagnation pressure": {"Soft biofilm / slime": 15.0,
-                               "Light weed / early growth": 60.0,
-                               "Hard calcareous / barnacle": 150.0, "Custom": None},
-        "Mean impact pressure": {"Soft biofilm / slime": 8.0,
-                                "Light weed / early growth": 30.0,
-                                "Hard calcareous / barnacle": 80.0, "Custom": None},
+        "Wall shear stress": {"Soft biofilm / slime": 0.05,
+                              "Light weed / early growth": 0.3,
+                              "Hard calcareous / barnacle": 1.0, "Custom": None},
+        "Stagnation pressure": {"Soft biofilm / slime": 0.2,
+                               "Light weed / early growth": 1.0,
+                               "Hard calcareous / barnacle": 4.0, "Custom": None},
+        "Mean impact pressure": {"Soft biofilm / slime": 0.2,
+                                "Light weed / early growth": 1.0,
+                                "Hard calcareous / barnacle": 4.0, "Custom": None},
     }[s.cleaning_measure]
     _foul_choice = container.selectbox(
         f"Fouling type (sets removal {_unit})", list(_presets.keys()), index=0,
         key=k("foul_preset"),
-        help="Minimum delivered intensity needed to lift this fouling. "
-             "Calibrate to a run you KNOW cleans your fouling — the live "
-             "value at your standoff is shown below.")
+        help="Minimum delivered intensity to lift this fouling, from the "
+             "HYDRODYNAMIC-cleaning literature (soft biofouling removes at "
+             "10–280 Pa wall shear; practical in-water cleaning ≤ ~1.3 kPa). "
+             "NOT the static adhesion-bond strength (0.03–2 MPa for "
+             "barnacles) — that is ~100× higher and a different mechanism. "
+             "Still calibrate to a run you KNOW cleans your fouling.")
     if _presets[_foul_choice] is not None:
         s.removal_pressure_bar = _presets[_foul_choice]
     else:
-        _hi = 100.0 if _unit == "kPa" else 400.0
+        _hi = 5.0 if _unit == "kPa" else 30.0
+        _step = 0.05 if _unit == "kPa" else 0.5
         s.removal_pressure_bar = container.slider(
-            f"Removal threshold ({_unit})", 0.5, _hi,
-            float(s.removal_pressure_bar), step=0.5,
+            f"Removal threshold ({_unit})", 0.0, _hi,
+            float(s.removal_pressure_bar), step=_step,
             key=k("removal_pressure_bar"))
     _val = s.cleaning_intensity()
     _gate = "✅ above" if _val >= s.removal_pressure_bar else "❌ BELOW"
@@ -233,7 +244,8 @@ def scenario_controls(prefix: str, defaults: Scenario, container) -> Scenario:
         f"**{_val:.1f} {_unit}** ({s.cleaning_measure.lower()}) — {_gate} the "
         f"{s.removal_pressure_bar:.1f} {_unit} removal threshold. "
         f"(Exit v = {s.jet_exit_velocity:.0f} m/s, core "
-        f"{s.core_length_mm:.1f} mm.)")
+        f"{s.core_length_mm:.1f} mm.) Two regimes — see the **System & "
+        "impact** tab for the hydrodynamic-removal vs adhesion-bond bands.")
     s.min_passes = container.slider(
         "Minimum passes to clean", 1, 10, int(s.min_passes), key=k("min_passes"),
         help="Once the intensity gate is cleared, a cell must be struck at "
