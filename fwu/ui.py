@@ -221,6 +221,47 @@ def scenario_controls(prefix: str, defaults: Scenario, container) -> Scenario:
         help="Once the intensity gate is cleared, a cell must be struck at "
              "least this many times to count as cleaned.")
 
+    # Jet-physics constants that convert flow → impact. Most are ASSUMED
+    # (handbook values for a submerged straight-bore jet) and are the biggest
+    # source of model uncertainty — a film/dye firing test would replace them.
+    with container.expander("Jet physics (calibratable ⚠ assumed)"):
+        st.caption(
+            "These convert flow into the impact at the hull. Marked **⚠ "
+            "assumed** are handbook values — measure them (single-jet firing "
+            "test against pressure film / dye) to pin down the model. "
+            "The Calibration status panel lists what to measure first.")
+        s.nozzle_cd = st.slider(
+            "Discharge coefficient Cd ⚠", 0.6, 1.0, float(s.nozzle_cd),
+            step=0.01, key=k("nozzle_cd"),
+            help="Ratio of real to ideal (Bernoulli) exit velocity. ~0.92 "
+                 "derived from your 140 bar inlet vs 154 m/s exit — verify.")
+        s.decay_K = st.slider(
+            "Far-field decay constant K ⚠", 4.0, 7.0, float(s.decay_K),
+            step=0.1, key=k("decay_K"),
+            help="Centreline velocity beyond the core decays as v_c/v0 = "
+                 "K·d/x. ~5.5 for a straight bore (assumed — measure).")
+        s.core_factor = st.slider(
+            "Potential-core length (× exit dia) ⚠", 3.0, 8.0,
+            float(s.core_factor), step=0.5, key=k("core_factor"),
+            help="Length the jet holds full velocity = factor × exit dia. "
+                 "~5 for a straight bore (assumed).")
+        s.jet_half_angle_deg = st.slider(
+            "Jet half-angle (°) ⚠", 8.0, 20.0, float(s.jet_half_angle_deg),
+            step=0.5, key=k("jet_half_angle_deg"),
+            help="Spread half-angle of the free jet. ~14° straight bore "
+                 "(assumed — measure).")
+        s.skin_friction_cf = st.slider(
+            "Wall skin-friction Cf ⚠", 0.001, 0.008, float(s.skin_friction_cf),
+            step=0.0005, format="%.4f", key=k("skin_friction_cf"),
+            help="Sets wall shear τ = Cf·½ρv². ~0.003 for a turbulent wall "
+                 "jet (assumed). Only matters when the cleaning driver is "
+                 "Wall shear.")
+        s.water_density = st.selectbox(
+            "Water density (kg/m³)", [1000.0, 1026.0],
+            index=0 if s.water_density < 1013 else 1,
+            key=k("water_density"),
+            help="1000 fresh / 1026 seawater. ✓ known.")
+
     container.subheader("Hull strip & KPIs")
     s.sim_length_mm = container.slider(
         "Hull strip length to simulate (mm)", 500, 10000, s.sim_length_mm, step=100,
