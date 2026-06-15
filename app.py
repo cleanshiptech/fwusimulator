@@ -85,9 +85,91 @@ if not compare_mode:
         st.divider()
         scen = scenario_controls("single", Scenario(), st.sidebar)
 
-    tab_impact, tab_motion, tab_hull, tab_system = st.tabs(
-        ["Impact simulation", "Motion simulation", "Hull simulation",
-         "System & impact"])
+    tab_overview, tab_impact, tab_motion, tab_hull, tab_system = st.tabs(
+        ["Overview", "Impact simulation", "Motion simulation",
+         "Hull simulation", "System & impact"])
+
+    # =============================================================
+    # TAB 0 — Overview (how it all fits together)
+    # =============================================================
+    with tab_overview:
+        st.subheader("How this system cleans — the whole picture")
+        st.markdown(
+            "A patch of hull is cleaned when it gets **enough impact** (the "
+            "jet hits hard enough) **AND enough coverage** (it is struck "
+            "often enough). Two independent gates — miss either and it is not "
+            "clean. Everything you can change feeds one of these two."
+        )
+        st.markdown("### Cleaning  =  Impact  ×  Coverage")
+
+        ov_imp, ov_cov = st.columns(2)
+        with ov_imp:
+            st.markdown("#### 💥 Impact — *how hard the jet hits*")
+            _meas = scen.cleaning_measure
+            _val = scen.cleaning_intensity()
+            _unit = "kPa" if _meas.startswith("Wall") else "bar"
+            st.metric(f"Delivered {_meas.lower()}", f"{_val:.1f} {_unit}",
+                      help="The chosen impact measure at your standoff — must "
+                           "clear the fouling's removal threshold.")
+            st.markdown(
+                "**Set directly by**\n"
+                f"- **Standoff** ({scen.standoff_mm} mm) — *the dominant "
+                "lever*; ~90% of impact is gone by 25 mm.\n"
+                f"- **Jet velocity** ({scen.jet_exit_velocity:.0f} m/s) at the "
+                "exit, which decays to the hull.\n\n"
+                "**…which is set by**\n"
+                f"- Pump **flow** ({scen.total_flow_lpm:.0f} L/min) ÷ "
+                f"**nozzles** ({scen.n_nozzles_total}) ÷ **bore** "
+                f"({scen.nozzle_exit_mm:.2f} mm) → exit velocity.\n"
+                "- **Jet decay** to the hull (core length, K, half-angle).\n"
+                "- *minus* umbilical friction (System tab).\n\n"
+                "**Trade-off:** more nozzles or a wider bore lowers the "
+                "pressure per jet (fixed pump flow)."
+            )
+        with ov_cov:
+            st.markdown("#### 🔁 Coverage — *how often each spot is hit*")
+            st.metric("Footprint on hull", f"{scen.footprint_dia():.1f} mm",
+                      help="Jet width at impact — wider covers more area but "
+                           "spreads the energy thinner (lower impact).")
+            st.markdown(
+                "**Set directly by**\n"
+                f"- **Disc rotation** ({scen.rpm} rpm) — passes per spot per "
+                "second.\n"
+                f"- **ROV forward speed** ({scen.rov_speed_kn:.1f} kn) — "
+                "faster = fewer passes + less dwell.\n"
+                f"- **Footprint width** ({scen.footprint_dia():.1f} mm) — "
+                "wider rings overlap more readily.\n\n"
+                "**…which is set by**\n"
+                f"- **Nozzles/disc** & **array geometry** (disc pitch, row "
+                "pitch, {0} discs) — whether rings overlap or leave gaps.\n"
+                "- Exit dia + standoff × spread → footprint width.\n\n"
+                "**Trade-off:** wider footprint helps coverage but *hurts* "
+                "impact — the two pull against each other.".format(
+                    scen.n_row1 + scen.n_row2)
+            )
+
+        st.info(
+            "**Footprint width sits in the middle:** a wider jet covers more "
+            "area (good for coverage) but spreads the same energy over more "
+            "hull (bad for impact). Standoff drives both — closer = harder "
+            "impact *and* a smaller, tighter footprint.")
+
+        st.markdown("### ⛔ Constraints that bound the whole thing")
+        st.markdown(
+            "- **Hose pressure ceiling** — the supply hose WP caps pump "
+            "pressure, so pressure is *not* a free lever (loss reduction is "
+            "the only path to more).\n"
+            "- **Umbilical drag** — at 2–3 kn the 300 m umbilical drag "
+            "approaches its breaking load; the real limit on ROV speed is "
+            "*drag*, not cleaning (System tab).\n"
+            "- **Cleaning mechanism** — whether it is jet shear, stagnation "
+            "pressure, or cavitation is **not yet confirmed**; pick the gating "
+            "measure in the sidebar and calibrate (System tab → Calibration "
+            "status).")
+        st.caption(
+            "Numbers above are your current scenario. The **Impact** and "
+            "**Motion/Hull** tabs simulate coverage; the **System & impact** "
+            "tab quantifies the impact chain and the operating constraints.")
 
     # =============================================================
     # TAB 1 — Impact simulation
