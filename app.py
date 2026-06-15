@@ -118,13 +118,16 @@ if not compare_mode:
                 f"- **Jet velocity** ({scen.jet_exit_velocity:.0f} m/s) at the "
                 "exit, which decays to the hull.\n\n"
                 "**…which is set by**\n"
-                f"- Pump **flow** ({scen.total_flow_lpm:.0f} L/min) ÷ "
-                f"**nozzles** ({scen.n_nozzles_total}) ÷ **bore** "
-                f"({scen.nozzle_exit_mm:.2f} mm) → exit velocity.\n"
-                "- **Jet decay** to the hull (core length, K, half-angle).\n"
-                "- *minus* umbilical friction (System tab).\n\n"
-                "**Trade-off:** more nozzles or a wider bore lowers the "
-                "pressure per jet (fixed pump flow)."
+                f"- Pump **flow** ({scen.total_flow_lpm:.0f} L/min, ≤ "
+                f"{scen.pump_flow_cap_lpm:.0f} cap) ÷ **nozzles** "
+                f"({scen.n_nozzles_total}) ÷ **bore** "
+                f"({scen.nozzle_exit_mm:.2f} mm) → exit velocity = Q/A. "
+                "Pressure is the *consequence*, not an input.\n"
+                "- **Jet decay** to the hull (core length, K, half-angle).\n\n"
+                "**Trade-off:** at fixed pump flow, more nozzles or a wider "
+                "bore *lowers* the velocity per jet (flow is split / spread). "
+                "The flow ceiling (pumps) and the hose pressure ceiling bound "
+                "the top end — see the System tab."
             )
         with ov_cov:
             st.markdown("#### 🔁 Coverage — *how often each spot is hit*")
@@ -987,40 +990,71 @@ if not compare_mode:
             "budget down the umbilical and the umbilical drag. Shown here so "
             "the friction-vs-drag trade-off is visible.")
 
-        # Pressure budget waterfall (250 → friction → manifold → nozzle).
-        _supply = 250.0
-        _hose_id_mm = 25.4
-        _len_m = 300.0
-        # Darcy friction for the 1" supply at the system flow (rough).
-        _q_total_m3s = scen.total_flow_lpm / 1000.0 / 60.0
-        _v_hose = _q_total_m3s / (math.pi * (_hose_id_mm / 2000.0) ** 2)
-        # ΔP ≈ f·(L/D)·½ρv²  with f≈0.02 (turbulent, smooth-ish)
-        _f = 0.02
-        _dp_friction = (_f * (_len_m / (_hose_id_mm / 1000.0))
-                        * 0.5 * 1026.0 * _v_hose ** 2) / 1e5
-        _inlet_measured = 140.0
-        _dp_manifold = 21.0   # derived minor losses
-        _accounted = _dp_friction + _dp_manifold
-        _unexplained = _supply - _inlet_measured - _accounted
+        # Pressure follows the flow: the commanded flow needs this nozzle
+        # (subsea) pressure, which implies this topside via the MEASURED
+        # transmission ratio (~0.57 across two systems). Pressure is a
+        # consequence here, not an input.
+        _subsea = scen.subsea_pressure_bar      # nozzle demand from the flow
+        _ratio = scen.pressure_transmission_ratio
+        _topside = scen.topside_pressure_bar    # = subsea ÷ ratio
+        _loss = _topside - _subsea
+        b1, b2, b3 = st.columns(3)
+        b1.metric("Subsea (nozzle) needed", f"{_subsea:.0f} bar",
+                  help="½ρ(v/Cd)² — the pressure at the manifold required to "
+                       "push the commanded flow through the nozzles.")
+        b2.metric("Transmission ✓", f"{_ratio * 100:.0f} %",
+                  delta=f"+{_loss:.0f} bar line loss", delta_color="inverse",
+                  help="Subsea ÷ topside — MEASURED ~57% across two systems "
+                       "(SSO3 + one other, Mar 2023–Mar 2025).")
+        b3.metric("Topside required",
+                  f"{_topside:.0f} bar",
+                  delta="over hose ceiling" if scen.pressure_ceiling_exceeded
+                  else f"of {scen.hose_pressure_ceiling_bar:.0f} ceiling",
+                  delta_color="inverse" if scen.pressure_ceiling_exceeded
+                  else "off",
+                  help="Pump-side pressure the flow demands = subsea ÷ "
+                       "transmission. Bounded by the hose/relief ceiling.")
+        st.caption(
+            f"Pressure is the **consequence of the flow**: {scen.total_flow_lpm:.0f} "
+            f"L/min needs {_subsea:.0f} bar at the nozzles, which (÷ the "
+            f"measured {_ratio:.2f} transmission) needs {_topside:.0f} bar "
+            "topside. The two-system data sets the ~0.57 ratio — replacing "
+            "the old assumed friction model; the ~42 bar 'unexplained' gap "
+            "was largely this proportional loss. Real scatter means it ranges "
+            "around this line.")
 
-        b1, b2, b3, b4 = st.columns(4)
-        b1.metric("Pump-side", f"{_supply:.0f} bar")
-        b2.metric("Hose friction", f"−{_dp_friction:.0f} bar",
-                  help=f"1\" × {_len_m:.0f} m at {_v_hose:.1f} m/s "
-                       "(Darcy, f≈0.02 — approximate).")
-        b3.metric("Manifold + nozzles", f"−{_dp_manifold:.0f} bar")
-        b4.metric("Wash-unit inlet", f"{_inlet_measured:.0f} bar",
-                  delta=f"{-_unexplained:.0f} bar unexplained"
-                  if abs(_unexplained) > 5 else None,
-                  delta_color="inverse")
-        if abs(_unexplained) > 5:
+        # Flow → velocity → pressure (all consequences of the commanded flow).
+        fl1, fl2, fl3 = st.columns(3)
+        fl1.metric("Commanded flow", f"{scen.total_flow_lpm:.0f} L/min",
+                   help=f"What you set; cap {scen.pump_flow_cap_lpm:.0f} "
+                        "L/min. Velocity follows as Q/A.")
+        fl2.metric("Exit velocity", f"{scen.jet_exit_velocity:.0f} m/s",
+                   help="v = Q/A per nozzle — flow-driven.")
+        fl3.metric("Pump usage",
+                   f"{100 * scen.total_flow_lpm / max(scen.pump_flow_cap_lpm, 1):.0f} %",
+                   help="Commanded flow as a fraction of the pump capacity.")
+        # Design-point note: full pump flow ↔ the resulting nozzle pressure.
+        _A_n = scen.nozzle_exit_area_m2 * scen.n_nozzles_total
+        _v_full = (scen.pump_flow_cap_lpm / 1000.0 / 60.0) / max(_A_n, 1e-12)
+        _p_full = 0.5 * scen.water_density \
+            * (_v_full / max(scen.nozzle_cd, 1e-6)) ** 2 / 1e5
+        st.caption(
+            f"Your nozzle area is matched to the pumps: **full flow "
+            f"({scen.pump_flow_cap_lpm:.0f} L/min) → ~{_p_full:.0f} bar at the "
+            f"nozzle** through {scen.n_nozzles_total} × "
+            f"{scen.nozzle_exit_mm:.2f} mm. That is the design point — the "
+            "bore is sized so full pump flow produces the working pressure.")
+        if scen.at_flow_cap:
+            st.info(
+                "ℹ️ **At the pump flow cap** — you can't push more flow "
+                "(hence velocity/impact) without changing the nozzles or "
+                "adding pump capacity.")
+        if scen.pressure_ceiling_exceeded:
             st.warning(
-                f"⚠ **~{_unexplained:.0f} bar unexplained** loss: pump-side "
-                f"{_supply:.0f} − measured inlet {_inlet_measured:.0f} = "
-                f"{_supply - _inlet_measured:.0f} bar drop, but friction + "
-                f"manifold only account for ~{_accounted:.0f} bar. Worth a "
-                "simultaneous gauge reading + line-walk for a restriction — "
-                "potentially recoverable pressure.")
+                f"⚠ This flow needs **{scen.topside_pressure_bar:.0f} bar "
+                f"topside**, above the {scen.hose_pressure_ceiling_bar:.0f} "
+                "bar hose/relief ceiling — the relief would bypass and full "
+                "flow can't be delivered. (The one real *pressure* limit.)")
 
         # Umbilical drag vs ROV speed, with MBL and a fairing toggle.
         st.markdown("**Umbilical drag vs ROV speed**")

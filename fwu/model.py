@@ -36,10 +36,20 @@ class Scenario:
     rpm: int = 850
     rov_speed_kn: float = 0.3
     nozzle_exit_mm: float = 1.3
-    # The pumps deliver a fixed total flow split across all nozzles; the jet
-    # exit velocity follows from continuity (v = Q/A per nozzle), and the
-    # impact at the hull follows from the submerged-jet decay below.
-    total_flow_lpm: float = 270.0   # 2 Denjet CE100-300 pumps (135 Lpm each)
+    # Causality (fixed-displacement pumps = FLOW source): you set pump
+    # frequency → flow; velocity = Q/A; nozzle pressure = ½ρ(v/Cd)² and the
+    # subsea/topside pressures are all CONSEQUENCES. Flow is the single input,
+    # capped at the pump capacity.
+    total_flow_lpm: float = 250.0           # commanded flow (measured op point)
+    pump_flow_cap_lpm: float = 270.0        # 2 Denjet CE100-300 = 4.5 L/s max
+    # Umbilical hose/relief pressure ceiling — the one true PRESSURE limit: if
+    # the topside needed to push the flow exceeds this, the relief bypasses
+    # and full flow can't be reached.
+    hose_pressure_ceiling_bar: float = 250.0
+    # Topside → subsea transmission: MEASURED ~0.57 across two systems (SSO3 +
+    # one other, Mar 2023–Mar 2025) — a ~43% umbilical line loss that scales
+    # with pressure. Used to show the topside pressure the flow implies.
+    pressure_transmission_ratio: float = 0.57
 
     # Jet / impact physics (submerged turbulent free jet). All "assumed"
     # values are calibratable — replace with measured numbers from a film /
@@ -81,10 +91,10 @@ class Scenario:
 
     @property
     def flow_per_nozzle_lpm(self) -> float:
-        """Pump flow divided evenly across every nozzle (L/min)."""
+        """Commanded pump flow divided across every nozzle (L/min)."""
         return self.total_flow_lpm / max(self.n_nozzles_total, 1)
 
-    # ---- Jet exit state (from flow continuity) ---------------------------
+    # ---- Jet exit state (flow-controlled: pump flow → velocity → pressure) --
     @property
     def nozzle_exit_area_m2(self) -> float:
         d = self.nozzle_exit_mm / 1000.0
@@ -92,9 +102,40 @@ class Scenario:
 
     @property
     def jet_exit_velocity(self) -> float:
-        """Jet exit velocity v = Q/A per nozzle (m/s). Q = flow per nozzle."""
+        """Exit velocity v = Q/A per nozzle (m/s). Flow is the input."""
         q_m3s = self.flow_per_nozzle_lpm / 1000.0 / 60.0
         return q_m3s / max(self.nozzle_exit_area_m2, 1e-12)
+
+    @property
+    def subsea_pressure_bar(self) -> float:
+        """
+        Nozzle (subsea) pressure that RESULTS from the flow: ½ρ(v/Cd)². This
+        is the pressure needed at the manifold to push the commanded flow
+        through the nozzles — a consequence, not an input.
+        """
+        v = self.jet_exit_velocity
+        return 0.5 * self.water_density * (v / max(self.nozzle_cd, 1e-6)) ** 2 / 1e5
+
+    @property
+    def topside_pressure_bar(self) -> float:
+        """
+        Topside (pump-side) pressure the flow implies = subsea ÷ transmission
+        ratio (the umbilical loss works back up from the nozzle demand).
+        """
+        return self.subsea_pressure_bar / max(self.pressure_transmission_ratio,
+                                               1e-6)
+
+    @property
+    def at_flow_cap(self) -> bool:
+        """True when commanded flow is at (or above) the pump capacity."""
+        return self.total_flow_lpm >= self.pump_flow_cap_lpm - 1e-6
+
+    @property
+    def pressure_ceiling_exceeded(self) -> bool:
+        """The one real pressure limit: if the topside the flow demands exceeds
+        the hose/relief ceiling, the relief bypasses and full flow can't be
+        delivered."""
+        return self.topside_pressure_bar > self.hose_pressure_ceiling_bar
 
     @property
     def pressure_bar(self) -> float:
@@ -202,7 +243,8 @@ def scenario_key(s: Scenario) -> tuple:
             s.nozzle_radius_mm, s.nozzle_cant_deg, s.standoff_mm,
             s.counter_rotate, s.pressure_bar, s.footprint_mode,
             s.footprint_dia_mm_override, s.nozzle_exit_mm, s.jet_spread_deg,
-            s.resolved_cell_mm, s.total_flow_lpm)
+            s.resolved_cell_mm, s.total_flow_lpm, s.pump_flow_cap_lpm,
+            s.pressure_transmission_ratio, s.hose_pressure_ceiling_bar)
 
 
 def scenario_full_key(s: Scenario) -> tuple:

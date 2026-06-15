@@ -72,21 +72,42 @@ def scenario_controls(prefix: str, defaults: Scenario, container) -> Scenario:
     s.nozzle_exit_mm = container.slider(
         "Nozzle exit diameter (mm)", 0.5, 5.0, s.nozzle_exit_mm, step=0.1,
         key=k("nozzle_exit_mm"))
+    # Fixed-displacement pumps are a FLOW source: you set the flow (pump
+    # frequency), and velocity = Q/A → nozzle pressure → topside all follow.
+    s.pump_flow_cap_lpm = container.slider(
+        "Pump flow capacity (L/min)", 50.0, 600.0,
+        float(s.pump_flow_cap_lpm), step=10.0, key=k("pump_flow_cap_lpm"),
+        help="Max combined pump flow (2 Denjet CE100-300 = 270 L/min = "
+             "4.5 L/s). The hard ceiling on flow, hence on jet velocity.")
     s.total_flow_lpm = container.slider(
-        "Total pump flow (L/min)", 50.0, 600.0, float(s.total_flow_lpm),
-        step=10.0, key=k("total_flow_lpm"),
-        help="Combined flow from the pumps (2 Denjet ≈ 270 L/min). This is "
-             "split evenly across all nozzles; the nozzle pressure is "
-             "DERIVED from it, not set directly.")
-    # Nozzle pressure is now a derived quantity — show it live so the
-    # flow→pressure coupling is explicit.
+        "Commanded pump flow (L/min)", 50.0, float(s.pump_flow_cap_lpm),
+        min(float(s.total_flow_lpm), float(s.pump_flow_cap_lpm)), step=10.0,
+        key=k("total_flow_lpm"),
+        help="What you set via pump frequency (≤ the capacity above). "
+             "Velocity = Q/A follows; nozzle and topside pressures are the "
+             "consequence — you do NOT set pressure directly.")
+    s.pressure_transmission_ratio = container.slider(
+        "Subsea→topside transmission ✓ measured", 0.30, 1.0,
+        float(s.pressure_transmission_ratio), step=0.01,
+        key=k("pressure_transmission_ratio"),
+        help="Subsea ÷ topside pressure. MEASURED at ~0.57 across two systems "
+             "(SSO3 + one other, Mar 2023–Mar 2025) — a ~43% umbilical line "
+             "loss. Used to work the required topside back up from the nozzle "
+             "demand.")
+    # Show the flow → velocity → pressure chain (all consequences of flow).
+    _cap_note = " ⚠ at pump cap" if s.at_flow_cap else ""
     container.caption(
-        f"→ **{s.n_nozzles_total} nozzles** "
-        f"({s.n_row1 + s.n_row2} discs × {s.n_nozzles}) share "
-        f"{s.total_flow_lpm:.0f} L/min = "
-        f"**{s.flow_per_nozzle_lpm:.1f} L/min/nozzle** → nozzle pressure "
-        f"**{s.pressure_bar:.0f} bar** (orifice law Q = K·d²·√p). "
-        "Adding nozzles or widening the exit lowers this.")
+        f"→ {s.total_flow_lpm:.0f} L/min{_cap_note} through "
+        f"{s.n_nozzles_total} × {s.nozzle_exit_mm:.2f} mm → exit velocity "
+        f"**{s.jet_exit_velocity:.0f} m/s** (v = Q/A) → nozzle "
+        f"**{s.subsea_pressure_bar:.0f} bar** → topside "
+        f"**{s.topside_pressure_bar:.0f} bar** (÷ {s.pressure_transmission_ratio:.2f}).")
+    if s.pressure_ceiling_exceeded:
+        container.warning(
+            f"⚠ Required topside {s.topside_pressure_bar:.0f} bar exceeds the "
+            f"{s.hose_pressure_ceiling_bar:.0f} bar hose/relief ceiling — the "
+            "relief would bypass, so this flow can't actually be delivered. "
+            "Reduce flow, widen the bore, or reduce the umbilical loss.")
 
     container.subheader("Jet footprint model")
     _fp_modes = [
