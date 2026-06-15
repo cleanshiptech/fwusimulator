@@ -144,7 +144,7 @@ if not compare_mode:
                 f"| | |\n|---|---|\n"
                 f"| Pump flow cap | {scen.pump_flow_cap_lpm:.0f} L/min |\n"
                 f"| Hose pressure (WP) | {scen.hose_pressure_ceiling_bar:.0f} bar topside |\n"
-                f"| Umbilical MBL | 60 kN (drag-limited ~2–3 kn) |\n"
+                f"| Umbilical MBL | 60 kN (drag nears it ~3 kn) |\n"
                 f"| Max subsea reachable | {scen.max_subsea_pressure_bar:.0f} bar |\n"
                 f"| Transmission (meas.) | ×{scen.pressure_transmission_ratio:.2f} |")
         st.caption(
@@ -226,9 +226,11 @@ if not compare_mode:
             "- **Hose pressure ceiling** — the supply hose WP caps pump "
             "pressure, so pressure is *not* a free lever (loss reduction is "
             "the only path to more).\n"
-            "- **Umbilical drag** — at 2–3 kn the 300 m umbilical drag "
-            "approaches its breaking load; the real limit on ROV speed is "
-            "*drag*, not cleaning (System tab).\n"
+            "- **Coverage is the speed limit, not drag.** In practice you get "
+            "**ring marks** (rings stop overlapping) above ~0.3–0.5 kn — so "
+            "*coverage* caps your traverse speed. Umbilical drag stays modest "
+            "(~25% of the 60 kN MBL even at 1.5 kn) and only nears the MBL "
+            "around ~3 kn (System tab).\n"
             "- **Cleaning mechanism** — whether it is jet shear, stagnation "
             "pressure, or cavitation is **not yet confirmed**; pick the gating "
             "measure in the sidebar and calibrate (System tab → Calibration "
@@ -948,8 +950,8 @@ if not compare_mode:
                 "measures as the jet decays. Standoff is the dominant lever "
                 "(~90% of impact gone by 25 mm).\n"
                 "- **Operational constraints** — the pressure budget down the "
-                "umbilical and the umbilical drag, which is the real binding "
-                "limit near 2–3 kn.\n\n"
+                "umbilical and the umbilical drag (modest until ~3 kn; in "
+                "practice *coverage*, not drag, caps the traverse speed).\n\n"
                 "Many jet constants (K, Cd, half-angle, Cf) are **assumed** — "
                 "see the Calibration status below and the sidebar *Jet "
                 "physics* expander.")
@@ -1248,10 +1250,12 @@ if not compare_mode:
         st.pyplot(figu, clear_figure=True)
         st.caption(
             f"At {scen.rov_speed_kn:.1f} kn the 300 m × Ø123 mm umbilical drag "
-            f"is **{_cur_drag/1000:.1f} kN** (Cd={_cd_umb}) vs the "
-            f"{_MBL/1000:.0f} kN MBL. Drag ∝ speed² and dominates all other "
-            "forces — it, not pump pressure, is the binding operational limit "
-            "near 2–3 kn. A fairing relieves it with no pressure cost.")
+            f"is **{_cur_drag/1000:.1f} kN** (Cd={_cd_umb}) — "
+            f"{100 * _cur_drag / _MBL:.0f}% of the {_MBL/1000:.0f} kN MBL. "
+            "Drag ∝ speed², so it stays modest (~25% MBL at 1.5 kn bare) and "
+            "only nears the MBL around ~3 kn. In practice **coverage** (ring "
+            "marks above ~0.3–0.5 kn) caps the traverse speed first, not drag. "
+            "A fairing roughly halves drag if you ever do run fast.")
 
 else:
     with st.sidebar:
