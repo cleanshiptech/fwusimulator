@@ -96,11 +96,12 @@ if not compare_mode:
         # ---- The system as it is today -----------------------------------
         st.subheader("The system as it is today")
         st.markdown(
-            "Two pumps feed one umbilical down to the ROV-mounted wash unit, "
-            "whose rotating discs fire jets at the hull. Flow (and so "
-            "pressure) is regulated **topside** by a bleed valve; two pressure "
-            "sensors bracket the umbilical so the line loss is measured, not "
-            "assumed."
+            "Two pumps feed a 1\" transport tube and then the umbilical down to "
+            "the ROV-mounted wash unit, whose rotating discs fire jets at the "
+            "hull. Flow (and so pressure) is regulated **topside** by a bleed "
+            "valve; two pressure sensors bracket the run so the total line "
+            "loss is measured, not assumed. The transport-tube length varies "
+            "between setups, which can shift the loss."
         )
         # Live flow/pressure chain through the system.
         _flow = scen.delivered_flow_lpm
@@ -113,8 +114,10 @@ if not compare_mode:
         T-JUNCTION  +  3-way BLEED VALVE ┘   ◀── regulate flow/pressure (bleed off excess)
          ⌖ [TOPSIDE pressure sensor]  ........  {_top:>4.0f} bar   (just after the valve)
                      │
-         UMBILICAL — 300 m, Ø123 mm, 1" supply hose,  × {scen.pressure_transmission_ratio:.2f} line loss (measured)
-                     │
+         TRANSPORT TUBE — 1" bore, T-junction → umbilical
+                     │                  (length varies by setup; adds line loss)
+         UMBILICAL — 300 m, Ø123 mm bundle, 1" supply hose inside
+                     │                  total topside→subsea × {scen.pressure_transmission_ratio:.2f} loss (measured)
         UMBILICAL ↔ ROV junction
          ⌖ [SUBSEA pressure sensor]  .........  {_sub:>4.0f} bar   (at the wash unit)
                      │
